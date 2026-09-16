@@ -1,0 +1,4 @@
+*_work/
+*.partial.mp4
+__pycache__/
+*.pyc

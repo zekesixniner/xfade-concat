@@ -36,7 +36,7 @@ from dataclasses import dataclass, field
 from fractions import Fraction
 from pathlib import Path
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
 GOPRO_RE = re.compile(r"^G([A-Z])(\d{2})(\d{4})", re.IGNORECASE)
 RENUMBER = "setpts=N/FRAME_RATE/TB"  # hw-frame safe (touches timestamps only)
@@ -77,12 +77,17 @@ MESSAGES = {
         "warn_no_audio": "warning: no audio stream {s} in {names} -> output without audio",
         "warn_shorten": "warning: transition {a} -> {b} shortened to {d:.3f}s (clips too short for {want:.3f}s)",
         "warn_no_nvenc": "warning: ffmpeg has no hevc_nvenc -> using libx265 (CPU, slow)",
+        "warn_nb_frames": "warning: {name}: container claims {tag} frames but only {real} are "
+                          "actually shown - likely cut mid-GOP from a master (hidden pre-roll "
+                          "behind an edit list); using the real, playable count",
         "warn_fallback_full": "warning: smart mode needs HEVC 4:2:0 8/10-bit sources ({name}: {codec} {pix}) -> --mode full",
         "warn_no_idr": "warning: {name}: no usable IDR keyframes within {w}s of the cuts -> "
                        "the whole clip is re-encoded (open GOP or very long GOP?)",
         "warn_bframes": "warning: --bframes is ignored in smart mode (re-encoded pieces use 0)",
         "warn_dts": "warning: the join reported timestamp problems:\n{log}",
         "warn_ps": "warning: pieces have different VPS/SPS/PPS; the joined file may not play everywhere",
+        "warn_copy_fallback": "warning: {name}: the copied stretch had an inconsistent B-frame "
+                              "pattern (would break timestamps at the join) -> re-encoding it instead",
         "err_ffmpeg": "ffmpeg failed (exit {code}):\n  {cmd}",
         "err_ffprobe": "ffprobe failed on {path}:\n{err}",
         "err_not_found": "'{exe}' not found (add C:\\ffmpeg\\bin to PATH or pass --ffmpeg/--ffprobe)",
@@ -123,12 +128,17 @@ MESSAGES = {
         "warn_no_audio": "varning: ljudström {s} saknas i {names} -> utdata utan ljud",
         "warn_shorten": "varning: övergång {a} -> {b} kortad till {d:.3f}s (klippen för korta för {want:.3f}s)",
         "warn_no_nvenc": "varning: ffmpeg saknar hevc_nvenc -> använder libx265 (CPU, långsamt)",
+        "warn_nb_frames": "varning: {name}: behållaren uppger {tag} rutor men bara {real} visas "
+                          "faktiskt - troligen klippt mitt i en GOP från ett master (dolt förspel "
+                          "bakom en edit-list); använder det riktiga, spelbara antalet",
         "warn_fallback_full": "varning: smart-läget kräver HEVC 4:2:0 8/10-bit ({name}: {codec} {pix}) -> --mode full",
         "warn_no_idr": "varning: {name}: inga användbara IDR-keyframes inom {w}s från klippunkterna -> "
                        "hela klippet kodas om (öppen GOP eller mycket lång GOP?)",
         "warn_bframes": "varning: --bframes ignoreras i smart-läget (omkodade bitar använder 0)",
         "warn_dts": "varning: skarvningen rapporterade tidsstämpelproblem:\n{log}",
         "warn_ps": "varning: bitarna har olika VPS/SPS/PPS; filen kanske inte spelas överallt",
+        "warn_copy_fallback": "varning: {name}: den kopierade sträckan hade ett ojämnt B-frame-mönster "
+                              "(hade gett trasiga tidsstämplar vid skarven) -> kodar om den istället",
         "err_ffmpeg": "ffmpeg misslyckades (felkod {code}):\n  {cmd}",
         "err_ffprobe": "ffprobe misslyckades för {path}:\n{err}",
         "err_not_found": "hittar inte '{exe}' (lägg C:\\ffmpeg\\bin i PATH eller ange --ffmpeg/--ffprobe)",
@@ -277,7 +287,7 @@ def probe_clip(ffprobe: str, path: Path) -> Clip:
     info = ffprobe_json(
         ffprobe,
         ["-show_entries",
-         "format=start_time:stream=index,codec_type,codec_name,width,height,pix_fmt,"
+         "format=start_time,duration:stream=index,codec_type,codec_name,width,height,pix_fmt,"
          "r_frame_rate,avg_frame_rate,time_base,nb_frames,start_time,color_range,"
          "color_space,color_transfer,color_primaries,channels,channel_layout"],
         path)
@@ -290,11 +300,27 @@ def probe_clip(ffprobe: str, path: Path) -> Clip:
     avg = v.get("avg_frame_rate", "0/0")
     if avg not in ("0/0", v["r_frame_rate"]) and abs(float(Fraction(avg) - fps)) > 0.01:
         warn("warn_vfr", name=path.name, r=fps, a=Fraction(avg))
-    frames = int(v.get("nb_frames") or 0)
-    if frames <= 0:
-        cnt = ffprobe_json(ffprobe, ["-select_streams", "v:0", "-count_packets",
-                                     "-show_entries", "stream=nb_read_packets"], path)
-        frames = int(cnt["streams"][0]["nb_read_packets"])
+    tag = int(v.get("nb_frames") or 0)
+    fmt_dur = info.get("format", {}).get("duration")
+    approx = round(float(fmt_dur) * fps) if fmt_dur else None
+    if tag and approx is not None and abs(tag - approx) <= 1:
+        # container duration agrees with the tag - an ordinary, uncut recording.
+        # No edit list to worry about, so skip the expensive decode-based count.
+        frames = tag
+    else:
+        # Neither the muxer's nb_frames tag nor a raw packet count can be trusted
+        # here: a clip cut with `-ss T -i master -t N -c copy` where T lands
+        # mid-GOP forces ffmpeg to keep the whole preceding GOP as hidden
+        # pre-roll (behind an edit list) so the file can still be decoded
+        # correctly - the container then reports more packets than are actually
+        # meant to be shown. A real decode count respects the edit list and
+        # gives the true, playable frame count. Only paid for the clips that
+        # actually need it (tag disagreeing with duration flags them).
+        cnt = ffprobe_json(ffprobe, ["-select_streams", "v:0", "-count_frames",
+                                     "-show_entries", "stream=nb_read_frames"], path)
+        frames = int(cnt["streams"][0]["nb_read_frames"])
+        if tag and tag != frames:
+            warn("warn_nb_frames", name=path.name, tag=tag, real=frames)
     color = {k: v[k] for k in ("color_range", "color_space", "color_transfer",
                                "color_primaries") if v.get(k) and v[k] != "unknown"}
     m = GOPRO_RE.match(path.name)
@@ -946,10 +972,27 @@ def main() -> None:
                 return False, t("err_delay", name=path.name, got=got, want=delay)
         return True, ""
 
+    def copy_piece_monotonic(path: Path) -> bool:
+        """A copy piece's B-frame delay is only measured at its keyframe; a source
+        encoder with a variable (non-constant) reorder depth deeper in the same
+        GOP can still produce a piece whose DTS collide or go backwards even
+        though the first packet checked out fine. Verify the whole sequence."""
+        res = subprocess.run([args.ffprobe, "-v", "error", "-select_streams", "v:0",
+                              "-show_entries", "packet=dts", "-of", "csv=p=0", str(path)],
+                             capture_output=True, text=True)
+        prev = None
+        for line in res.stdout.split():
+            d = int(line)
+            if prev is not None and d <= prev:
+                return False
+            prev = d
+        return True
+
     # ---- video pieces, serially (one NVDEC/NVENC chip; parallel jobs corrupt frames)
     for idx, p in enumerate(pieces):
         head = f"[{idx + 1}/{len(pieces)}] {label(p)}"
-        if p.file.exists() and piece_ok(p.file, p)[0]:
+        if p.file.exists() and piece_ok(p.file, p)[0] and (
+                p.kind != "copy" or copy_piece_monotonic(p.file)):
             print(head + t("cached"))
             continue
         print(head)
@@ -959,6 +1002,24 @@ def main() -> None:
         if not ok:
             print(msg, file=sys.stderr)
             sys.exit(1)
+        if p.kind == "copy" and not copy_piece_monotonic(tmp):
+            # This source GOP's B-frame reorder depth isn't constant (varies
+            # deeper into the GOP than the keyframe we measured) - copying it
+            # verbatim would leave a bad DTS run in the final file. Re-encode
+            # this stretch instead, same as if no safe keyframe had been found.
+            warn("warn_copy_fallback", name=clips[p.clip].path.name)
+            tmp.unlink()
+            p.kind = "enc"
+            p.file = p.file.with_name(f"{idx:03d}_enc_{piece_key(p, clips, enc)}.mp4")
+            tmp = p.file.with_name(p.file.stem + ".partial.mp4")
+            if p.file.exists() and piece_ok(p.file, p)[0]:
+                print(head + t("cached"))
+                continue
+            run(enc.piece_cmd(p, clips, tmp), args.verbose)
+            ok, msg = piece_ok(tmp, p)
+            if not ok:
+                print(msg, file=sys.stderr)
+                sys.exit(1)
         os.replace(tmp, p.file)
 
     if not smart and len({param_sets_hash(args.ffprobe, p.file) for p in pieces}) > 1:

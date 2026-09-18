@@ -32,7 +32,7 @@ Times are seconds (`1.5`) or frames (`45f`).
 | `--head 0` / `--tail 0` | cut from the start / end of every clip first |
 | `--fade-in` / `--fade-out` | fade from / to black at the very start / end |
 | `--transition fade` | any xfade transition; `fade`, `dissolve`, `fadeblack` suit 360° best |
-| `--list clips.txt` | per-clip control (see below) |
+| `--list clips.txt` | per-clip control and ranges (see below) |
 
 A transition never uses more than 40 % of either clip; longer values are
 shortened with a warning.
@@ -43,11 +43,13 @@ shortened with a warning.
 # path                     options (all optional)
 GS010123-png_ovr.mp4       head=2.5 fade=1.5
 GS010124-png_ovr.mp4       tail=12f fade=0
+master.mp4                 in=00:01:24 dur=24
 "D:\flights\GS010125.mp4"
 ```
 
-`fade` on a line is the transition **into the next** clip. Relative paths are
-relative to the list file, and the order is exactly as written.
+`fade` on a line is the transition **into the next** clip. `in`/`dur`/`out` pick
+a stretch of the file (see below). Relative paths are relative to the list file,
+and the order is exactly as written.
 
 ### GoPro chapters
 
@@ -57,15 +59,38 @@ chapters of one recording (`GS01xxxx → GS02xxxx`) are joined seamlessly with n
 trim, and in smart mode without any re-encoding. `--head`/`--tail` then apply to
 the recording as a whole. Disable with `--no-sort` / `--no-group`.
 
-### Clips cut from a master with `-c copy`
+### Taking highlights straight from a master (recommended)
 
-Splitting highlights out of one long recording with
-`ffmpeg -ss T -i master.mp4 -t N -c copy clip.mp4` is fine, but only pass `-t`
-for a duration - **not `-to`**, which is an absolute end time and silently
-produces a much shorter clip than intended if `T` isn't 0. Either way, if `T`
-doesn't land exactly on a keyframe, the clip will contain a hidden pre-roll
-GOP behind an edit list; the tool detects and accounts for this on its own
-(see "Real frame count" below), so no extra flags are needed for it.
+Instead of pre-cutting segments with `ffmpeg -ss .. -t .. -c copy` and feeding
+those in, point the list file at the master and give each highlight a range:
+
+```text
+# path                        range                     options
+../GS00080-85_png_ovr.mp4     in=00:00:15  dur=12
+../GS00080-85_png_ovr.mp4     in=00:01:24  dur=24        fade=1
+../GS00080-85_png_ovr.mp4     in=00:03:24  out=00:03:36
+```
+
+`in=` is where the highlight starts, `dur=` how long it runs (`out=` gives an end
+time instead). Times are `12`, `1:30` or `00:04:30.5`. The same file may be
+listed as many times as you like.
+
+This is worth preferring, because pre-cutting with `-c copy` costs real quality
+of life:
+
+- a cut that doesn't land exactly on a keyframe makes ffmpeg keep the whole
+  preceding GOP as hidden pre-roll behind an edit list, which the tool then has
+  to detect and work around;
+- each pre-cut segment is usually too short to contain two keyframes, so smart
+  mode has nothing to copy and re-encodes almost everything;
+- ranges taken from the master keep the master's own keyframes, so far more of
+  the footage is copied instead of re-encoded — usually the difference between
+  re-encoding nearly all of it and re-encoding only the transitions.
+
+Pre-cut segments still work, and ranges and pre-cut files can be mixed freely.
+If you do pre-cut, pass `-t` for a duration — **not `-to`**, which is an
+absolute end time and silently gives a much shorter clip than intended when the
+start isn't 0.
 
 ## How it works
 
@@ -83,30 +108,33 @@ The tricky parts, and how they are handled:
   leading pictures (RADL/RASL). Cutting at an open-GOP CRA would drop or
   duplicate frames. Re-encoded pieces seek half a frame early and renumber
   timestamps (`setpts=N/FRAME_RATE/TB`).
-- **Real frame count, not container metadata.** A clip cut with
-  `ffmpeg -ss T -i master -t N -c copy` where `T` lands mid-GOP forces ffmpeg to
-  keep the whole preceding GOP as hidden pre-roll (behind an edit list) so the
-  file still decodes correctly - the container then reports more frames than
-  are actually meant to be shown (`nb_frames` and even a raw packet count both
-  include the hidden part). Trusting that number corrupts every cut computed
-  from it. The tool cross-checks the container's own duration against the
-  frame-count tag and, only when they disagree, pays for a real decode-based
-  count (`-count_frames`) to get the true, playable total - cheap for ordinary
-  recordings, since most never need it.
+- **Pieces are raw Annex B, not MP4.** Each piece is written as a bare `.hevc`
+  bitstream, so a piece has no container: no timestamps to rebase, no edit list
+  to inherit, no `hvcC` to clash with the next piece. Joining them is plain byte
+  concatenation, and one final mux re-derives every timestamp at a constant
+  frame rate. This is what makes pieces from three different sources — NVENC
+  re-encodes, CPU transitions and the camera's own untouched bitstream — line up
+  exactly. Doing it in MP4 instead means fighting B-frame reorder delays that
+  can vary *within* a single GOP, and edit lists that silently hide frames; both
+  produce "Non-monotonic DTS" and frozen frames at the joins.
 - **Different encoders in one file.** NVENC pieces and the source bitstream have
-  different VPS/SPS/PPS. Every piece carries its parameter sets **in-band**
-  (`hevc_mp4toannexb` / `dump_extra`), and the output uses the `hev1` tag.
-- **Monotonic timestamps at the joins.** Pieces with different B-frame delays
-  cannot be joined with plain `-c copy`: this gives "Non-monotonic DTS" and frozen
-  frames at the joins. Every piece's DTS is normalised to one common delay with
-  `setts`. A source encoder's B-frame reorder depth can still vary *within* one
-  GOP (seen with real NVENC/lookahead output) so a single per-keyframe
-  correction isn't always enough; each copy piece's full DTS sequence is
-  verified after the fact, and if it isn't strictly increasing, the tool
-  silently re-encodes that stretch instead of shipping a broken join.
-- **Checks.** Every piece is verified for frame count, timestamp delay, and (copy
-  pieces) full DTS monotonicity; the join is checked for timestamp warnings; the
-  output is checked for its total frame count.
+  different VPS/SPS/PPS. Every piece carries its parameter sets **in-band**,
+  repeated at each keyframe (`hevc_mp4toannexb` / `dump_extra`), and the output
+  uses the `hev1` tag.
+- **Real frame count, not container metadata.** When a clip was pre-cut mid-GOP,
+  the hidden pre-roll counts towards the container's frame tag *and* towards a
+  raw packet count, so both overstate how many frames actually play — and every
+  cut computed from that number is wrong. The first packet's timestamp is
+  negative by exactly the hidden part, so one cheap probe gives both the true
+  count and the shift, without decoding anything.
+- **Unambiguous seeking.** With an edit list in play, the same timestamp can
+  resolve to the hidden pre-roll keyframe instead of the intended one, which
+  silently copies the wrong stretch of video. Copy pieces therefore seek in the
+  file's own raw timeline (`-ignore_editlist`), where there is nothing to be
+  ambiguous about.
+- **Checks.** Every piece is verified for its frame count; the output is verified
+  for the frames that actually *play*, not the count the container advertises
+  (a frame hidden behind an edit list still shows up in `nb_frames`).
 
 Re-encoded pieces are decoded with NVDEC and encoded with NVENC. Transitions and
 black fades go through the CPU (`hwdownload`), because `xfade` has no CUDA
@@ -129,6 +157,10 @@ Always rebuilt in one pass: each clip is trimmed to exactly its video frames, jo
 
 Pieces are cached in `<output>_work/` under a hash of their settings. An
 interrupted run resumes where it stopped (`--keep-work` keeps them after success).
+
+Probing never decodes: clip lengths, keyframes and pre-roll all come from
+timestamps and bitstream headers. On 8K footage that is the difference between
+seconds and minutes per file.
 
 ## Where it fits in the pipeline
 
@@ -230,10 +262,9 @@ the last step. The output is written moov-last, which is its fast path.
   one has trouble, use `--mode full`.
 - Keyframes more than `--gop-window` seconds from a cut are not found; the whole clip
   is then re-encoded (a warning says so).
-- A copy piece that turns out to have an inconsistent B-frame pattern is
-  re-encoded instead automatically (a warning says so) - this costs the same
-  time as if no safe keyframe had been found there in the first place, just
-  discovered one step later.
+- A stretch shorter than the source's GOP cannot contain two keyframes, so it is
+  re-encoded whole (a note says so). This is the usual reason short pre-cut
+  segments copy nothing — taking ranges from the master instead avoids it.
 
 ## Testing
 
@@ -244,11 +275,14 @@ luma encodes the frame number:
 - sources with closed GOP + B-frames, open GOP (CRA with leading pictures) and GoPro chapters
 - head/tail/fade/fade-in/fade-out combinations at 25 and 29.97 fps, 8- and 10-bit
 - monotonic DTS, audio duration equals video duration
-- clips with a hidden pre-roll edit list (`-ss T -c copy` landing mid-GOP):
-  frame count and content verified correct once the real, decode-based count is used
+- clips with a hidden pre-roll edit list (`-ss T -c copy` landing mid-GOP),
+  including the case where seeking would otherwise copy the wrong stretch
 - a source GOP with a variable B-frame reorder depth (reproduced with x265
-  `--zones`): the resulting bad-DTS join was reproduced byte-for-byte against a
-  real failing run's log, and the copy→re-encode fallback was confirmed to
-  both trigger and produce a clean, monotonic join
+  `--zones`) — the case that produced frozen frames and a short output when
+  pieces were still joined as MP4
+- ranges taken straight from a master (`in=`/`dur=`), and piece caching/resume
+
+Twelve cases run as a suite, each checked for exact frame count, frame-by-frame
+content against the sources, no frozen runs, and audio matching video length.
 
 The NVENC/NVDEC path itself needs testing on the GPU machine.

@@ -9,10 +9,12 @@ made frame-exact:
   * the middle of every clip is stream-copied, cut on IDR keyframes only
   * only the short stretches around each transition are re-encoded:
       [last keyframe .. transition] + xfade + [transition .. next keyframe]
-  * every piece carries its own VPS/SPS/PPS in-band, so NVENC pieces and the
-    camera's/OVRLEY's own bitstream can live in one file (MP4 tag hev1)
-  * DTS of every piece is normalised to one common reorder delay, so the
-    joined file has monotonic timestamps (no frozen frames at the joins)
+  * pieces are written as raw Annex B (.hevc): no container, so no timestamps
+    to rebase, no edit lists to inherit and no hvcC to clash - joining them is
+    plain byte concatenation, and one final mux re-derives all timing at a
+    constant frame rate
+  * every piece carries its own VPS/SPS/PPS in-band, repeated at each keyframe,
+    so NVENC pieces and the camera's/OVRLEY's own bitstream live in one file
 Full mode (--mode full) re-encodes everything (any source codec).
 
 Audio is always rebuilt in one cheap pass (acrossfade at the joins, AAC).
@@ -32,11 +34,11 @@ import shlex
 import shutil
 import subprocess
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from fractions import Fraction
 from pathlib import Path
 
-__version__ = "0.2.1"
+__version__ = "0.3.0"
 
 GOPRO_RE = re.compile(r"^G([A-Z])(\d{2})(\d{4})", re.IGNORECASE)
 RENUMBER = "setpts=N/FRAME_RATE/TB"  # hw-frame safe (touches timestamps only)
@@ -83,11 +85,10 @@ MESSAGES = {
         "warn_fallback_full": "warning: smart mode needs HEVC 4:2:0 8/10-bit sources ({name}: {codec} {pix}) -> --mode full",
         "warn_no_idr": "warning: {name}: no usable IDR keyframes within {w}s of the cuts -> "
                        "the whole clip is re-encoded (open GOP or very long GOP?)",
+        "warn_short_gop": "note: {name}: no two keyframes fit in the {span:.1f}s kept from this "
+                          "clip, so it is re-encoded (the source's GOP is longer than that)",
         "warn_bframes": "warning: --bframes is ignored in smart mode (re-encoded pieces use 0)",
         "warn_dts": "warning: the join reported timestamp problems:\n{log}",
-        "warn_ps": "warning: pieces have different VPS/SPS/PPS; the joined file may not play everywhere",
-        "warn_copy_fallback": "warning: {name}: the copied stretch had an inconsistent B-frame "
-                              "pattern (would break timestamps at the join) -> re-encoding it instead",
         "err_ffmpeg": "ffmpeg failed (exit {code}):\n  {cmd}",
         "err_ffprobe": "ffprobe failed on {path}:\n{err}",
         "err_not_found": "'{exe}' not found (add C:\\ffmpeg\\bin to PATH or pass --ffmpeg/--ffprobe)",
@@ -104,10 +105,10 @@ MESSAGES = {
         "err_trim": "{name}: head+tail ({ht:.3f}s) >= clip length ({length:.3f}s)",
         "err_fade_io": "{name}: --fade-in/--fade-out do not fit in the clip",
         "err_frames": "{name}: expected {want} frames, got {got}",
-        "err_delay": "{name}: timestamp delay is {got} frame(s), expected {want} - "
-                     "source GOP structure changes mid-file? Try --mode full",
         "err_list_kv": "{file}:{line}: expected key=value, got '{tok}'",
-        "err_list_key": "{file}:{line}: unknown option '{key}' (head/tail/fade)",
+        "err_list_key": "{file}:{line}: unknown option '{key}' (in/dur/out/head/tail/fade)",
+        "err_list_dur_out": "{file}:{line}: use either dur= or out=, not both",
+        "err_range": "{name}: the in/dur/out range does not fit in the clip ({length:.3f}s long)",
     },
     "sv": {
         "probing": "Läser in {n} fil(er)...",
@@ -134,11 +135,10 @@ MESSAGES = {
         "warn_fallback_full": "varning: smart-läget kräver HEVC 4:2:0 8/10-bit ({name}: {codec} {pix}) -> --mode full",
         "warn_no_idr": "varning: {name}: inga användbara IDR-keyframes inom {w}s från klippunkterna -> "
                        "hela klippet kodas om (öppen GOP eller mycket lång GOP?)",
+        "warn_short_gop": "obs: {name}: det får inte plats två keyframes i de {span:.1f}s som "
+                          "behålls ur klippet, så det kodas om (källans GOP är längre än så)",
         "warn_bframes": "varning: --bframes ignoreras i smart-läget (omkodade bitar använder 0)",
         "warn_dts": "varning: skarvningen rapporterade tidsstämpelproblem:\n{log}",
-        "warn_ps": "varning: bitarna har olika VPS/SPS/PPS; filen kanske inte spelas överallt",
-        "warn_copy_fallback": "varning: {name}: den kopierade sträckan hade ett ojämnt B-frame-mönster "
-                              "(hade gett trasiga tidsstämplar vid skarven) -> kodar om den istället",
         "err_ffmpeg": "ffmpeg misslyckades (felkod {code}):\n  {cmd}",
         "err_ffprobe": "ffprobe misslyckades för {path}:\n{err}",
         "err_not_found": "hittar inte '{exe}' (lägg C:\\ffmpeg\\bin i PATH eller ange --ffmpeg/--ffprobe)",
@@ -155,10 +155,10 @@ MESSAGES = {
         "err_trim": "{name}: head+tail ({ht:.3f}s) >= klippets längd ({length:.3f}s)",
         "err_fade_io": "{name}: --fade-in/--fade-out får inte plats i klippet",
         "err_frames": "{name}: väntade {want} rutor, fick {got}",
-        "err_delay": "{name}: tidsstämpelfördröjning {got} ruta/rutor, väntade {want} - "
-                     "ändras källans GOP-struktur i filen? Prova --mode full",
         "err_list_kv": "{file}:{line}: väntade nyckel=värde, fick '{tok}'",
-        "err_list_key": "{file}:{line}: okänt alternativ '{key}' (head/tail/fade)",
+        "err_list_key": "{file}:{line}: okänt alternativ '{key}' (in/dur/out/head/tail/fade)",
+        "err_list_dur_out": "{file}:{line}: använd antingen dur= eller out=, inte båda",
+        "err_range": "{name}: intervallet in/dur/out får inte plats i klippet ({length:.3f}s långt)",
     },
 }
 LANG = "en"
@@ -265,6 +265,11 @@ class Clip:
     head_raw: str | None = None
     tail_raw: str | None = None
     fade_raw: str | None = None
+    in_raw: str | None = None
+    dur_raw: str | None = None
+    out_raw: str | None = None
+    label: str = ""          # file name, plus the range when one was given
+    raw_offset: float = 0.0  # raw_time = edited_time + raw_offset (edit-list shift)
     out_start: int = 0
     keyframes: dict = field(default_factory=dict)  # idx -> Keyframe
 
@@ -300,27 +305,46 @@ def probe_clip(ffprobe: str, path: Path) -> Clip:
     avg = v.get("avg_frame_rate", "0/0")
     if avg not in ("0/0", v["r_frame_rate"]) and abs(float(Fraction(avg) - fps)) > 0.01:
         warn("warn_vfr", name=path.name, r=fps, a=Fraction(avg))
+    # An edit list shifts the timeline the demuxer reports. Two things follow
+    # from it, and both matter:
+    #   * the container's frame tag counts the hidden pre-roll as well, so it
+    #     overstates how many frames actually play;
+    #   * a plain -ss becomes ambiguous, because the same timestamp can resolve
+    #     to the pre-roll keyframe instead of the intended one.
+    # The first packet's timestamp gives the shift directly (it is negative by
+    # exactly the hidden part), so both fall out of one cheap probe - no need to
+    # decode the clip to count it, which on 8K footage takes minutes per file.
+    def first_pts(extra: list[str]) -> float | None:
+        j = ffprobe_json(ffprobe, [*extra, "-select_streams", "v:0",
+                                   "-read_intervals", "%+#1",
+                                   "-show_entries", "packet=pts_time"], path)
+        pk = (j.get("packets") or [{}])[0].get("pts_time")
+        return float(pk) if pk not in (None, "N/A") else None
+
+    edited_first = first_pts([])
+    raw_offset = 0.0
+    if edited_first is not None and edited_first < 0:
+        # Only an edit list can push the first timestamp negative, and only then
+        # is a second probe worth its process start-up.
+        raw_first = first_pts(["-ignore_editlist", "1"])
+        if raw_first is not None:
+            raw_offset = raw_first - edited_first
+
     tag = int(v.get("nb_frames") or 0)
-    fmt_dur = info.get("format", {}).get("duration")
-    approx = round(float(fmt_dur) * fps) if fmt_dur else None
-    if tag and approx is not None and abs(tag - approx) <= 1:
-        # container duration agrees with the tag - an ordinary, uncut recording.
-        # No edit list to worry about, so skip the expensive decode-based count.
-        frames = tag
-    else:
-        # Neither the muxer's nb_frames tag nor a raw packet count can be trusted
-        # here: a clip cut with `-ss T -i master -t N -c copy` where T lands
-        # mid-GOP forces ffmpeg to keep the whole preceding GOP as hidden
-        # pre-roll (behind an edit list) so the file can still be decoded
-        # correctly - the container then reports more packets than are actually
-        # meant to be shown. A real decode count respects the edit list and
-        # gives the true, playable frame count. Only paid for the clips that
-        # actually need it (tag disagreeing with duration flags them).
-        cnt = ffprobe_json(ffprobe, ["-select_streams", "v:0", "-count_frames",
-                                     "-show_entries", "stream=nb_read_frames"], path)
-        frames = int(cnt["streams"][0]["nb_read_frames"])
-        if tag and tag != frames:
-            warn("warn_nb_frames", name=path.name, tag=tag, real=frames)
+    preroll = round(-edited_first * fps) if edited_first and edited_first < 0 else 0
+    frames = tag - preroll
+    if frames <= 0:
+        # No usable tag (or something unexpected): count packets the slow-but-sure
+        # way. Still demux-only - the pre-roll is exactly the run of packets the
+        # edit list pushes to a negative timestamp.
+        res = subprocess.run([ffprobe, "-v", "error", "-select_streams", "v:0",
+                              "-show_entries", "packet=pts_time", "-of", "csv=p=0",
+                              str(path)], capture_output=True, text=True)
+        frames = sum(1 for x in res.stdout.split()
+                     if x and x[0] != "N" and float(x.rstrip(",")) >= -1e-6)
+    if preroll:
+        warn("warn_nb_frames", name=path.name, tag=tag, real=frames)
+
     color = {k: v[k] for k in ("color_range", "color_space", "color_transfer",
                                "color_primaries") if v.get(k) and v[k] != "unknown"}
     m = GOPRO_RE.match(path.name)
@@ -331,7 +355,7 @@ def probe_clip(ffprobe: str, path: Path) -> Clip:
         v_start=float(v.get("start_time") or 0.0),
         f_start=float(info.get("format", {}).get("start_time") or 0.0),
         audio=[s for s in streams if s.get("codec_type") == "audio"],
-        color=color,
+        color=color, raw_offset=raw_offset,
         gopro=(m.group(1).upper(), int(m.group(2)), int(m.group(3))) if m else None)
 
 
@@ -342,8 +366,11 @@ def scan_keyframes(ffmpeg: str, clip: Clip, start_s: float, dur_s: float) -> Non
     (RADL/RASL) follow it: those are decoded after it but belong to the previous
     stretch in display order (open GOP, IDR_W_RADL with leading pictures)."""
     seek = max(0.0, start_s - clip.f_start)
+    # -to, not -t: with -copyts the timestamps stay absolute, so a duration limit
+    # would be measured against them and cut the scan short (or drop it entirely)
+    # for any window that does not start near the beginning of the file.
     cmd = [ffmpeg, "-hide_banner", "-nostdin", "-v", "debug", "-ss", f"{seek:.6f}", "-copyts",
-           "-i", str(clip.path), "-t", f"{dur_s:.3f}", "-map", "0:v:0", "-c", "copy",
+           "-i", str(clip.path), "-to", f"{seek + dur_s:.6f}", "-map", "0:v:0", "-c", "copy",
            "-bsf:v", "trace_headers", "-f", "null", "-"]
     res = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
     pkt_re = re.compile(r"Packet: \d+ bytes, (key frame, )?pts (-?\d+|NOPTS), dts (-?\d+|NOPTS)")
@@ -384,8 +411,25 @@ def scan_keyframes(ffmpeg: str, clip: Clip, start_s: float, dur_s: float) -> Non
 # --------------------------------------------------------------------------- #
 # list file
 # --------------------------------------------------------------------------- #
+def parse_clock(value: str) -> str:
+    """Accept 12, 1:30, 00:04:30.5 - returns plain seconds as a string."""
+    v = str(value).strip()
+    if ":" not in v:
+        return v
+    total = Fraction(0)
+    for part in v.split(":"):
+        total = total * 60 + Fraction(part or "0")
+    return str(float(total))
+
+
 def read_list_file(list_path: Path) -> list[tuple[Path, dict]]:
-    """Lines: <path> [head=..] [tail=..] [fade=..]   ('#' starts a comment)."""
+    """Lines: <path> [in=..] [dur=..|out=..] [head=..] [tail=..] [fade=..]
+
+    in/dur/out select a stretch of the file, so highlights can be taken
+    straight from one long master instead of being pre-cut with
+    `ffmpeg -ss .. -t .. -c copy` (which leaves hidden pre-roll behind an edit
+    list and destroys most of smart mode's copying). The same file may be
+    listed many times with different ranges. '#' starts a comment."""
     rows: list[tuple[Path, dict]] = []
     base = list_path.resolve().parent
     for lineno, raw in enumerate(list_path.read_text(encoding="utf-8-sig").splitlines(), 1):
@@ -401,9 +445,12 @@ def read_list_file(list_path: Path) -> list[tuple[Path, dict]]:
             if "=" not in tok:
                 die("err_list_kv", file=list_path, line=lineno, tok=tok)
             k, val = tok.split("=", 1)
-            if k.lower() not in ("head", "tail", "fade"):
+            k = k.lower()
+            if k not in ("head", "tail", "fade", "in", "dur", "out"):
                 die("err_list_key", file=list_path, line=lineno, key=k)
-            opts[k.lower()] = val
+            opts[k] = parse_clock(val) if k in ("in", "dur", "out") else val
+        if "dur" in opts and "out" in opts:
+            die("err_list_dur_out", file=list_path, line=lineno)
         rows.append((p, opts))
     return rows
 
@@ -444,12 +491,25 @@ def assign_trims(clips: list[Clip], args, fps: Fraction) -> None:
                 a.fade = a.tail = b.head = 0
 
     for c in clips:
+        # in/dur/out pick a stretch of the file; they are just a friendlier way
+        # of saying head/tail, so everything downstream stays the same.
+        if c.in_raw is not None:
+            c.head = parse_time(c.in_raw, fps, f"in ({c.path.name})")
+        if c.dur_raw is not None:
+            c.tail = c.frames - c.head - parse_time(c.dur_raw, fps, f"dur ({c.path.name})")
+        elif c.out_raw is not None:
+            c.tail = c.frames - parse_time(c.out_raw, fps, f"out ({c.path.name})")
+        if c.tail < 0:
+            die("err_range", name=c.path.name, length=secs(c.frames, fps))
         if c.head_raw is not None:
             c.head = parse_time(c.head_raw, fps, f"head ({c.path.name})")
         if c.tail_raw is not None:
             c.tail = parse_time(c.tail_raw, fps, f"tail ({c.path.name})")
         if c.fade_raw is not None:
             c.fade = parse_time(c.fade_raw, fps, f"fade ({c.path.name})")
+        c.label = c.path.name
+        if c.in_raw is not None or c.dur_raw is not None or c.out_raw is not None:
+            c.label = f"{c.path.name} @{hms(secs(c.head, fps))}"
 
     if args.fades:
         vals = args.fades.split(",")
@@ -520,12 +580,11 @@ def build_plan(clips: list[Clip], fps: Fraction, fade_in: int, fade_out: int,
 # ffmpeg command builders
 # --------------------------------------------------------------------------- #
 class Enc:
-    def __init__(self, args, clips: list[Clip], smart: bool, delay: int):
+    def __init__(self, args, clips: list[Clip], smart: bool):
         c0 = clips[0]
         self.args = args
         self.fps = c0.fps
         self.smart = smart
-        self.delay = delay  # common reorder delay (frames) for every piece
         depth = args.bit_depth
         if depth == "auto":
             depth = "10" if ("10" in c0.pix_fmt or "p010" in c0.pix_fmt) else "8"
@@ -575,16 +634,11 @@ class Enc:
             "transfer_characteristics": TRANSFER.get(col.get("color_transfer"), 2),
             "matrix_coefficients": MATRIX.get(col.get("color_space"), 2),
             "video_full_range_flag": 1 if col.get("color_range") == "pc" else 0}.items())
-        bsf = [f"hevc_metadata={vui}"]
-        if smart:
-            bsf.append("dump_extra=freq=keyframe")  # parameter sets in-band
-            if delay:
-                bsf.append(f"setts=dts=DTS-round({fsec(delay, self.fps)}/TB)")
-        self.enc_bsf = ",".join(bsf)
-        self.tag = "hev1" if smart else "hvc1"
-
-    def mux_args(self) -> list[str]:
-        return ["-tag:v", self.tag, "-video_track_timescale", str(self.timescale)]
+        # Pieces are written as raw Annex B, which has no container timestamps and
+        # no edit lists at all - so parameter sets must travel in-band, repeated at
+        # every keyframe, and the final mux re-derives all timing from the stream.
+        self.enc_bsf = f"hevc_metadata={vui},dump_extra=freq=keyframe"
+        self.tag = "hev1"  # parameter sets change mid-stream at the joins
 
     def input_args(self, clip: Clip, frame: int) -> list[str]:
         a: list[str] = []
@@ -613,17 +667,20 @@ class Enc:
                 "-stats", "-y"]
         a = clips[p.clip]
         if p.kind == "copy":
+            # Straight bitstream copy into raw Annex B: no container means no
+            # timestamps to rebase and no edit list to inherit, so the frames
+            # come through exactly as they are in the source.
             kf = a.keyframes.get(p.src)
-            seek = float(kf.pts * a.tb) - a.f_start + 0.5 / float(a.fps) if p.src else 0.0
-            p0 = kf.pts if kf else 0
-            extra = self.delay - (kf.delay if kf else 0)
-            setts = f"setts=pts=PTS-{p0}:dts=DTS-{p0}"
-            if extra:
-                setts += f"-round({fsec(extra, self.fps)}/TB)"
-            cmd = base + (["-ss", f"{seek:.6f}"] if p.src else []) + [
-                "-copyts", "-i", str(a.path), "-map", "0:v:0", "-frames:v", str(p.frames),
-                "-c", "copy", "-bsf:v", f"hevc_mp4toannexb,{setts}"]
-            return cmd + self.mux_args() + ["-an", "-sn", "-dn", "-f", "mp4", str(out)]
+            pre = ["-ignore_editlist", "1"]
+            if p.src and kf is not None:
+                # half a frame past the keyframe, in raw time: unambiguous even
+                # when a hidden pre-roll keyframe sits earlier in the timeline
+                seek = float(kf.pts * a.tb) + a.raw_offset + 0.5 / float(a.fps)
+                pre += ["-ss", f"{seek:.6f}"]
+            cmd = base + pre + [
+                "-i", str(a.path), "-map", "0:v:0", "-frames:v", str(p.frames),
+                "-c", "copy", "-bsf:v", "hevc_mp4toannexb"]
+            return cmd + ["-an", "-sn", "-dn", "-f", "hevc", str(out)]
 
         if p.kind == "enc":
             cmd = base + self.input_args(a, p.src)
@@ -645,7 +702,7 @@ class Enc:
                      + ",".join([*self.fades(p), f"format={self.encfmt}"]) + "[v]")
             cmd += ["-filter_complex", graph, "-map", "[v]"]
         return cmd + ["-frames:v", str(p.frames), "-an", "-sn", "-dn", *self.video_args,
-                      "-bsf:v", self.enc_bsf, *self.mux_args(), "-f", "mp4", str(out)]
+                      "-bsf:v", self.enc_bsf, "-f", "hevc", str(out)]
 
 
 def audio_cmd(args, clips: list[Clip], fps: Fraction, total: int, fade_in: int,
@@ -682,46 +739,6 @@ def audio_cmd(args, clips: list[Clip], fps: Fraction, total: int, fade_in: int,
                   "-c:a", "aac", "-b:a", args.audio_bitrate, "-f", "mp4", str(out)]
 
 
-def first_packet(ffprobe: str, path: Path) -> tuple[int, int, int]:
-    """(nb_frames, pts, dts) of the video stream's first packet, in stream ticks."""
-    info = ffprobe_json(ffprobe, ["-select_streams", "v:0", "-read_intervals", "%+#1",
-                                  "-show_entries", "stream=nb_frames:packet=pts,dts"], path)
-    frames = int(info["streams"][0].get("nb_frames") or 0)
-    pk = (info.get("packets") or [{}])[0]
-    return frames, int(pk.get("pts", 0)), int(pk.get("dts", 0))
-
-
-def param_sets_hash(ffprobe: str, path: Path) -> str:
-    """Hash of VPS/SPS/PPS in the hvcC box (SEI arrays such as x265's info string skipped)."""
-    res = subprocess.run([ffprobe, "-v", "error", "-select_streams", "v:0", "-show_streams",
-                          "-show_data", str(path)], capture_output=True, text=True)
-    raw = bytearray()
-    in_dump = False
-    for line in res.stdout.splitlines():
-        if line.startswith("extradata="):
-            in_dump = True
-            continue
-        if in_dump:
-            m = re.match(r"^[0-9a-f]{8}: (.{39})", line)
-            if not m:
-                break
-            raw += bytes.fromhex(m.group(1).replace(" ", ""))
-    if len(raw) < 23:
-        return hashlib.sha1(bytes(raw)).hexdigest()
-    keep = bytearray()
-    pos = 23
-    for _ in range(raw[22]):
-        nal_type = raw[pos] & 0x3F
-        count = int.from_bytes(raw[pos + 1:pos + 3], "big")
-        pos += 3
-        for _ in range(count):
-            size = int.from_bytes(raw[pos:pos + 2], "big")
-            if nal_type not in (39, 40):
-                keep += raw[pos:pos + 2 + size]
-            pos += 2 + size
-    return hashlib.sha1(bytes(keep)).hexdigest()
-
-
 def piece_key(p: Piece, clips: list[Clip], enc: Enc) -> str:
     def src(i):
         c = clips[i]
@@ -730,7 +747,7 @@ def piece_key(p: Piece, clips: list[Clip], enc: Enc) -> str:
     spec = {"p": [p.kind, p.src, p.frames, p.src_b, p.fade_in, p.fade_out],
             "a": src(p.clip), "b": src(p.clip_b) if p.clip_b is not None else None,
             "tr": enc.args.transition, "enc": enc.video_args, "bsf": enc.enc_bsf,
-            "hw": enc.hw, "delay": enc.delay, "ts": enc.timescale, "v": __version__}
+            "hw": enc.hw, "ts": enc.timescale, "v": __version__}
     return hashlib.sha1(json.dumps(spec, sort_keys=True).encode()).hexdigest()[:10]
 
 
@@ -835,9 +852,16 @@ def main() -> None:
         die("err_no_inputs")
 
     print(t("probing", n=len(paths)))
-    clips = [probe_clip(args.ffprobe, p) for p in paths]
+    probed: dict[Path, Clip] = {}
+    clips = []
+    for path in paths:
+        key = path.resolve()
+        if key not in probed:
+            probed[key] = probe_clip(args.ffprobe, path)
+        clips.append(replace(probed[key]))   # own trims per row, shared probe result
     for c, o in zip(clips, overrides):
         c.head_raw, c.tail_raw, c.fade_raw = o.get("head"), o.get("tail"), o.get("fade")
+        c.in_raw, c.dur_raw, c.out_raw = o.get("in"), o.get("dur"), o.get("out")
     if not args.list and not args.no_sort and all(c.gopro for c in clips):
         clips.sort(key=lambda c: (c.gopro[0], c.gopro[2], c.gopro[1]))
 
@@ -883,24 +907,37 @@ def main() -> None:
             b0 = secs(c.head + in_ov + (fade_in if i == 0 else 0), fps) + c.v_start
             b1 = secs(c.frames - c.tail - c.fade - (fade_out if i == len(clips) - 1 else 0),
                       fps) + c.v_start
-            windows = [(max(0.0, b0 - 1.0), w + 1.0)]
+            # look forward from the body start and backward from the body end
+            spans = [(max(0.0, b0 - 1.0), b0 + w)]
             if b1 < secs(c.frames, fps) + c.v_start - 1e-6:
-                windows.append((max(0.0, b1 - w), w + 1.0))
-            if len(windows) == 2 and windows[1][0] <= windows[0][0] + windows[0][1]:
-                windows = [(windows[0][0], windows[1][0] + windows[1][1] - windows[0][0])]
-            for start, dur in windows:
-                scan_keyframes(args.ffmpeg, c, start, dur)
+                spans.append((max(0.0, b1 - w), b1 + 1.0))
+            merged: list[list[float]] = []
+            for lo, hi in sorted(spans):
+                if merged and lo <= merged[-1][1]:
+                    merged[-1][1] = max(merged[-1][1], hi)
+                else:
+                    merged.append([lo, hi])
+            for lo, hi in merged:
+                scan_keyframes(args.ffmpeg, c, lo, hi - lo)
 
     pieces, total = build_plan(clips, fps, fade_in, fade_out, smart, min_copy)
-    # one common reorder delay for all pieces = largest delay among copied keyframes
-    delay = max((clips[p.clip].keyframes[p.src].delay for p in pieces if p.kind == "copy"),
-                default=0)
     if smart:
         for i, c in enumerate(clips):
             body = [p for p in pieces if p.clip == i and p.kind != "xfade"]
-            if not any(p.kind == "copy" for p in body) and sum(p.frames for p in body) > 2 * min_copy:
-                warn("warn_no_idr", name=c.path.name, w=args.gop_window)
-    enc = Enc(args, clips, smart, delay)
+            if any(p.kind == "copy" for p in body):
+                continue
+            span = sum(p.frames for p in body)
+            if span <= 2 * min_copy:
+                continue
+            # Distinguish "this file has no keyframes we can cut on" from the
+            # ordinary case of a stretch shorter than the source's GOP, where
+            # there simply is not room for two keyframes to copy between.
+            if not any(kf.safe for kf in c.keyframes.values()):
+                warn("warn_no_idr", name=c.label or c.path.name, w=args.gop_window)
+            else:
+                warn("warn_short_gop", name=c.label or c.path.name,
+                     span=secs(span, fps))
+    enc = Enc(args, clips, smart)
 
     # ---- plan printout
     copy_f = sum(p.frames for p in pieces if p.kind == "copy")
@@ -911,7 +948,7 @@ def main() -> None:
             fade="fade->", out="out start"))
     for i, c in enumerate(clips):
         fade_txt = f"{secs(c.fade, fps):7.3f}" if i < len(clips) - 1 else "      -"
-        print(f"{i:>3}  {c.path.name:<28} {secs(c.frames, fps):9.3f} {secs(c.head, fps):7.3f} "
+        print(f"{i:>3}  {(c.label or c.path.name):<28} {secs(c.frames, fps):9.3f} {secs(c.head, fps):7.3f} "
               f"{secs(c.tail, fps):7.3f} {fade_txt} {hms(secs(c.out_start, fps)):>13}")
     print(t("output_line", dur=hms(secs(total, fps)), frames=total, pieces=len(pieces),
             copy=hms(secs(copy_f, fps)), enc=hms(secs(total - copy_f, fps)),
@@ -919,7 +956,7 @@ def main() -> None:
 
     work = (args.work_dir or output.with_name(output.stem + "_work")).resolve()
     for idx, p in enumerate(pieces):
-        p.file = work / f"{idx:03d}_{p.kind}_{piece_key(p, clips, enc)}.mp4"
+        p.file = work / f"{idx:03d}_{p.kind}_{piece_key(p, clips, enc)}.hevc"
 
     timeline = {
         "tool": f"xfade_concat {__version__}",
@@ -943,9 +980,9 @@ def main() -> None:
     }
 
     def label(p: Piece) -> str:
-        src = clips[p.clip].path.name
+        src = clips[p.clip].label or clips[p.clip].path.name
         if p.clip_b is not None:
-            src += f" -> {clips[p.clip_b].path.name}"
+            src += f" -> {clips[p.clip_b].label or clips[p.clip_b].path.name}"
         return f"{p.kind:<5} {src}  [{secs(p.src, fps):.3f}s +{secs(p.frames, fps):.3f}s]"
 
     if args.dry_run:
@@ -959,71 +996,30 @@ def main() -> None:
         return
 
     work.mkdir(parents=True, exist_ok=True)
-    fdur = Fraction(1) / fps
 
-    def piece_ok(path: Path, p: Piece) -> tuple[bool, str]:
-        frames, pts, dts = first_packet(args.ffprobe, path)
-        if frames != p.frames:
-            return False, t("err_frames", name=path.name, want=p.frames, got=frames)
-        if smart:
-            tb = Fraction(1, enc.timescale)
-            got = round((pts - dts) * tb / fdur)
-            if got != delay:
-                return False, t("err_delay", name=path.name, got=got, want=delay)
-        return True, ""
-
-    def copy_piece_monotonic(path: Path) -> bool:
-        """A copy piece's B-frame delay is only measured at its keyframe; a source
-        encoder with a variable (non-constant) reorder depth deeper in the same
-        GOP can still produce a piece whose DTS collide or go backwards even
-        though the first packet checked out fine. Verify the whole sequence."""
-        res = subprocess.run([args.ffprobe, "-v", "error", "-select_streams", "v:0",
-                              "-show_entries", "packet=dts", "-of", "csv=p=0", str(path)],
-                             capture_output=True, text=True)
-        prev = None
-        for line in res.stdout.split():
-            d = int(line)
-            if prev is not None and d <= prev:
-                return False
-            prev = d
-        return True
+    def piece_frames(path: Path) -> int:
+        """Frames in a raw Annex B piece. One packet = one access unit = one
+        frame, and there is no container metadata that could disagree, so this
+        is both exact and demux-only (no decoding)."""
+        info = ffprobe_json(args.ffprobe, ["-f", "hevc", "-select_streams", "v:0",
+                                           "-count_packets",
+                                           "-show_entries", "stream=nb_read_packets"], path)
+        return int(info["streams"][0].get("nb_read_packets") or 0)
 
     # ---- video pieces, serially (one NVDEC/NVENC chip; parallel jobs corrupt frames)
     for idx, p in enumerate(pieces):
         head = f"[{idx + 1}/{len(pieces)}] {label(p)}"
-        if p.file.exists() and piece_ok(p.file, p)[0] and (
-                p.kind != "copy" or copy_piece_monotonic(p.file)):
+        if p.file.exists() and piece_frames(p.file) == p.frames:
             print(head + t("cached"))
             continue
         print(head)
-        tmp = p.file.with_name(p.file.stem + ".partial.mp4")
+        tmp = p.file.with_name(p.file.stem + ".partial.hevc")
         run(enc.piece_cmd(p, clips, tmp), args.verbose)
-        ok, msg = piece_ok(tmp, p)
-        if not ok:
-            print(msg, file=sys.stderr)
+        got = piece_frames(tmp)
+        if got != p.frames:
+            print(t("err_frames", name=tmp.name, want=p.frames, got=got), file=sys.stderr)
             sys.exit(1)
-        if p.kind == "copy" and not copy_piece_monotonic(tmp):
-            # This source GOP's B-frame reorder depth isn't constant (varies
-            # deeper into the GOP than the keyframe we measured) - copying it
-            # verbatim would leave a bad DTS run in the final file. Re-encode
-            # this stretch instead, same as if no safe keyframe had been found.
-            warn("warn_copy_fallback", name=clips[p.clip].path.name)
-            tmp.unlink()
-            p.kind = "enc"
-            p.file = p.file.with_name(f"{idx:03d}_enc_{piece_key(p, clips, enc)}.mp4")
-            tmp = p.file.with_name(p.file.stem + ".partial.mp4")
-            if p.file.exists() and piece_ok(p.file, p)[0]:
-                print(head + t("cached"))
-                continue
-            run(enc.piece_cmd(p, clips, tmp), args.verbose)
-            ok, msg = piece_ok(tmp, p)
-            if not ok:
-                print(msg, file=sys.stderr)
-                sys.exit(1)
         os.replace(tmp, p.file)
-
-    if not smart and len({param_sets_hash(args.ffprobe, p.file) for p in pieces}) > 1:
-        warn("warn_ps")
 
     # ---- audio
     audio_file = None
@@ -1034,29 +1030,50 @@ def main() -> None:
         run(audio_cmd(args, clips, fps, total, fade_in, fade_out, tmp), args.verbose)
         os.replace(tmp, audio_file)
 
-    # ---- join
-    list_txt = work / "pieces.txt"
-    list_txt.write_text("".join("file '" + p.file.as_posix().replace("'", r"'\''") + "'\n"
-                                for p in pieces), encoding="utf-8")
+    # ---- join: the pieces are raw Annex B, so joining them is plain byte
+    # concatenation. Streaming them into ffmpeg's stdin avoids writing a second
+    # copy of the whole video to disk, and avoids a command line with one
+    # argument per piece. ffmpeg re-derives every timestamp from the bitstream
+    # at a constant frame rate, which is what makes the result frame-exact
+    # regardless of how the individual pieces were produced.
     cmd = [args.ffmpeg, "-hide_banner", "-nostdin", "-loglevel", "warning", "-y",
-           "-f", "concat", "-safe", "0", "-i", str(list_txt)]
+           "-fflags", "+genpts", "-f", "hevc", "-r", str(fps), "-i", "pipe:0"]
     if audio_file:
         cmd += ["-i", str(audio_file), "-map", "0:v:0", "-map", "1:a:0"]
     else:
         cmd += ["-map", "0:v:0"]
-    cmd += ["-c", "copy", "-tag:v", enc.tag, str(output)]
+    # avoid_negative_ts make_zero: genpts can hand the first packet a negative
+    # timestamp, and the mp4 muxer would then write an edit list that hides that
+    # frame from playback - the file would claim the right frame count while
+    # presenting one fewer.
+    cmd += ["-c", "copy", "-tag:v", enc.tag, "-avoid_negative_ts", "make_zero",
+            "-video_track_timescale", str(enc.timescale), "-f", "mp4", str(output)]
     print(t("join", name=output.name))
     if args.verbose:
-        print("  $ " + fmt_cmd(cmd))
-    res = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
-    if res.returncode != 0:
-        print(res.stderr, file=sys.stderr)
-        die("err_ffmpeg", code=res.returncode, cmd=fmt_cmd(cmd))
-    ts_issues = [ln for ln in res.stderr.splitlines() if "monoton" in ln.lower()]
+        print("  $ cat <pieces> | " + fmt_cmd(cmd))
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        for p in pieces:
+            with open(p.file, "rb") as fh:
+                shutil.copyfileobj(fh, proc.stdin, 1 << 20)
+        proc.stdin.close()
+    except BrokenPipeError:
+        pass
+    err = proc.stderr.read().decode("utf-8", "replace")
+    if proc.wait() != 0:
+        print(err, file=sys.stderr)
+        die("err_ffmpeg", code=proc.returncode, cmd=fmt_cmd(cmd))
+    ts_issues = [ln for ln in err.splitlines() if "monoton" in ln.lower()]
     if ts_issues:
         warn("warn_dts", log="\n".join(ts_issues[:10]))
 
-    got = first_packet(args.ffprobe, output)[0]
+    # Count what actually plays, not what the container claims: a frame hidden
+    # behind an edit list still shows up in nb_frames.
+    res = subprocess.run([args.ffprobe, "-v", "error", "-select_streams", "v:0",
+                          "-show_entries", "packet=pts_time", "-of", "csv=p=0",
+                          str(output)], capture_output=True, text=True)
+    got = sum(1 for x in res.stdout.split()
+              if x and x[0] != "N" and float(x.rstrip(",")) >= -1e-6)
     if got != total:
         die("err_frames", name=output.name, want=total, got=got)
 

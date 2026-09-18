@@ -1,0 +1,21 @@
+# Ranges taken straight from the master - no pre-cutting needed.
+# in = start, dur = length.  Add fade=<s> on a line to change that junction.
+
+../GS00080-85_png_ovr.mp4    in=00:00:15  dur=00:00:12
+../GS00080-85_png_ovr.mp4    in=00:01:24  dur=00:00:24
+../GS00080-85_png_ovr.mp4    in=00:03:24  dur=00:00:12
+../GS00080-85_png_ovr.mp4    in=00:03:24  dur=00:00:12
+../GS00080-85_png_ovr.mp4    in=00:10:22  dur=00:00:15
+../GS00080-85_png_ovr.mp4    in=00:14:57  dur=00:00:25
+../GS00080-85_png_ovr.mp4    in=00:21:25  dur=00:00:20
+../GS00080-85_png_ovr.mp4    in=00:29:04  dur=00:00:20
+../GS00080-85_png_ovr.mp4    in=00:36:55  dur=00:00:25
+../GS00080-85_png_ovr.mp4    in=00:44:50  dur=00:00:20
+../GS00080-85_png_ovr.mp4    in=00:49:05  dur=00:00:25
+../GS00080-85_png_ovr.mp4    in=00:53:52  dur=00:00:25
+../GS00080-85_png_ovr.mp4    in=00:54:30  dur=00:00:55
+../GS00080-85_png_ovr.mp4    in=00:56:07  dur=00:00:12
+../GS00080-85_png_ovr.mp4    in=00:57:07  dur=00:00:12
+../GS00080-85_png_ovr.mp4    in=00:58:07  dur=00:00:12
+../GS00080-85_png_ovr.mp4    in=00:59:07  dur=00:00:12
+../GS00080-85_png_ovr.mp4    in=00:59:47  dur=00:00:43

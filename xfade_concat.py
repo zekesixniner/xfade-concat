@@ -38,7 +38,7 @@ from dataclasses import dataclass, field, replace
 from fractions import Fraction
 from pathlib import Path
 
-__version__ = "0.4.0"
+__version__ = "0.4.1"
 
 GOPRO_RE = re.compile(r"^G([A-Z])(\d{2})(\d{4})", re.IGNORECASE)
 RENUMBER = "setpts=N/FRAME_RATE/TB"  # hw-frame safe (touches timestamps only)
@@ -98,6 +98,7 @@ MESSAGES = {
         "err_no_video": "no video stream in {path}",
         "err_no_inputs": "need at least one input clip",
         "err_no_output": "-o/--output is required",
+        "err_audio_mode": "{name}: unknown audio mode '{val}' (retime, keep or mute)",
         "err_speed": "{name}: invalid speed '{val}' (e.g. 2, 1.5, 0.5, 1/3)",
         "err_speed_range": "{name}: speed {val} is outside the supported 0.02-50 range",
         "err_speed_short": "{name}: nothing left of this clip at speed {val}",
@@ -110,6 +111,8 @@ MESSAGES = {
                      "    fade= transition into the NEXT clip",
         "tpl_cols5": "#   speed= 2 plays twice as fast, 0.5 half as fast (1.5, 3, 4, 6, "
                      "0.67, 0.33, 0.25, 0.12 ...)",
+        "tpl_cols6": "#   audio= retime (follows speed, default) | keep (normal pitch, "
+                     "truncated or looped) | mute",
         "tpl_master": "# {name} is {len} long. Replace the times below with your highlights.",
         "tpl_out_note": "# Add out=<end> to a row to have it checked against in+dur before encoding.",
         "tpl_files": "# {n} file(s), full length each. Add in=/dur= to use only part of one.",
@@ -166,6 +169,7 @@ MESSAGES = {
         "err_no_video": "ingen videoström i {path}",
         "err_no_inputs": "behöver minst ett klipp",
         "err_no_output": "-o/--output krävs",
+        "err_audio_mode": "{name}: okänt ljudläge '{val}' (retime, keep eller mute)",
         "err_speed": "{name}: ogiltig hastighet '{val}' (t.ex. 2, 1.5, 0.5, 1/3)",
         "err_speed_range": "{name}: hastigheten {val} ligger utanför intervallet 0.02-50",
         "err_speed_short": "{name}: inget kvar av klippet vid hastighet {val}",
@@ -178,6 +182,8 @@ MESSAGES = {
                      "    fade= övergång till NÄSTA klipp",
         "tpl_cols5": "#   speed= 2 spelar dubbelt så fort, 0.5 hälften så fort (1.5, 3, 4, 6, "
                      "0.67, 0.33, 0.25, 0.12 ...)",
+        "tpl_cols6": "#   audio= retime (följer hastigheten, standard) | keep (normal tonhöjd, "
+                     "avhugget eller loopat) | mute",
         "tpl_master": "# {name} är {len} lång. Byt ut tiderna nedan mot dina höjdpunkter.",
         "tpl_out_note": "# Lägg till out=<slut> på en rad för att få den kontrollerad mot in+dur.",
         "tpl_files": "# {n} fil(er), hela längden var. Lägg till in=/dur= för att bara ta en del.",
@@ -307,6 +313,7 @@ class Clip:
     row_file: str = ""
     row_line: str = ""
     speed_raw: str | None = None
+    audio_mode: str = ""            # retime | keep | mute
     speed: Fraction = Fraction(1)   # >1 plays faster, <1 slower
     out_len: int = 0                # frames this clip contributes to the output
     label: str = ""          # file name, plus the range when one was given
@@ -491,7 +498,7 @@ def read_list_file(list_path: Path) -> list[tuple[Path, dict]]:
                 die("err_list_kv", file=list_path, line=lineno, tok=tok)
             k, val = tok.split("=", 1)
             k = k.lower()
-            if k not in ("head", "tail", "fade", "in", "dur", "out", "speed"):
+            if k not in ("head", "tail", "fade", "in", "dur", "out", "speed", "audio"):
                 die("err_list_key", file=list_path, line=lineno, key=k)
             opts[k] = parse_clock(val) if k in ("in", "dur", "out") else val
         opts["_line"] = str(lineno)
@@ -841,9 +848,23 @@ def audio_cmd(args, clips: list[Clip], fps: Fraction, total: int, fade_in: int,
     for i, c in enumerate(clips):
         s = c.v_start + secs(c.head, fps)
         e = c.v_start + secs(c.frames - c.tail, fps)
+        want = secs(c.out_len, fps)          # seconds of audio this clip owes
+        have = e - s                         # seconds the source stretch holds
+        if c.audio_mode == "mute":
+            fit = ",volume=0"
+        elif c.audio_mode == "keep":
+            # leave pitch and tempo alone: a faster clip simply drops the audio
+            # it no longer has room for, a slower one repeats its own audio until
+            # the picture is covered. aloop repeats the whole stretch; the atrim
+            # below cuts the result to the exact length either way.
+            fit = ""
+            if want > have + 1e-9:
+                fit = f",aloop=loop=-1:size={max(1, round(have * 48000))}"
+        else:
+            fit = atempo_chain(c.speed)
         parts.append(f"[{i}:a:{args.audio_stream}]aresample=48000:async=1:first_pts=0,{afmt},"
                      f"apad,atrim=start={s:.9f}:end={e:.9f},asetpts=PTS-STARTPTS"
-                     f"{atempo_chain(c.speed)},apad,"
+                     f"{fit},apad,"
                      f"atrim=end={fsec(c.out_len, fps)},asetpts=PTS-STARTPTS[a{i}]")
     cur = "a0"
     for i in range(1, len(clips)):
@@ -947,7 +968,7 @@ def make_list(args) -> None:
              t("tpl_run", out="montage.mp4", name=dest.name),
              "#",
              t("tpl_cols1"), t("tpl_cols2"), t("tpl_cols3"), t("tpl_cols4"),
-             t("tpl_cols5"), "#"]
+             t("tpl_cols5"), t("tpl_cols6"), "#"]
 
     if args.rows:
         # range rows through one master: evenly spaced starting points, so every
@@ -1034,6 +1055,9 @@ def main() -> None:
     g.add_argument("--audio-stream", type=int, default=0, help="audio stream index per clip")
     g.add_argument("--audio-bitrate", default="192k")
     g.add_argument("--audio-curve", default="tri", help="acrossfade curve (tri, qsin, ...)")
+    g.add_argument("--clip-audio", choices=["retime", "keep", "mute"], default="retime",
+                   help="what a speed= clip does with its audio: retime it (default), "
+                        "keep it at normal pitch, or mute it. Per row: audio=keep")
 
     g = ap.add_argument_group("run")
     g.add_argument("--work-dir", type=Path, help="default: <output>_work next to the output")
@@ -1094,6 +1118,9 @@ def main() -> None:
         c.in_raw, c.dur_raw, c.out_raw = o.get("in"), o.get("dur"), o.get("out")
         c.row_file, c.row_line = o.get("_file", ""), o.get("_line", "")
         c.speed_raw = o.get("speed")
+        c.audio_mode = (o.get("audio") or args.clip_audio).lower()
+        if c.audio_mode not in ("retime", "keep", "mute"):
+            die("err_audio_mode", name=c.path.name, val=c.audio_mode)
     if not args.list and not args.no_sort and all(c.gopro for c in clips):
         clips.sort(key=lambda c: (c.gopro[0], c.gopro[2], c.gopro[1]))
 

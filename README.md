@@ -86,11 +86,27 @@ different speeds cross-fade correctly. `in`/`dur`/`head`/`tail` stay in source
 time — you pick the stretch first, and the speed applies to it.
 
 Speeding up drops frames and slowing down repeats them; there is no motion
-interpolation, which at 8K would cost far more than the encode itself. Audio is
-retimed with `atempo`, chained for the extreme ratios; stretched far enough it
-will sound like it, so `--no-audio` or a music bed is often the better answer for
-big slow-motion sections. A clip with `speed=` is always re-encoded, since there
-is nothing to copy when every frame moves.
+interpolation, which at 8K would cost far more than the encode itself. A clip
+with `speed=` is always re-encoded, since there is nothing to copy when every
+frame moves.
+
+#### What the audio does
+
+`audio=` decides that per row (or `--clip-audio` for all of them):
+
+| | |
+|---|---|
+| `retime` (default) | follows the picture, via a chain of `atempo`. Pitch is preserved, but stretched far enough it starts to sound like it |
+| `keep` | plays at its own normal speed and pitch. A faster clip drops the audio it no longer has room for; a slower one repeats its own audio until the picture is covered |
+| `mute` | silence for that clip |
+
+```text
+master.mp4   in=00:41:10  dur=00:00:08  speed=0.25  audio=keep
+master.mp4   in=00:12:30  dur=00:04:00  speed=6     audio=mute
+```
+
+`keep` is usually what you want for engine noise or ambience, where the sound
+should stay recognisable rather than turn into a growl or a chipmunk.
 
 ### GoPro chapters
 
@@ -280,6 +296,7 @@ Messages are English or Swedish: `--lang en|sv`, or `$env:GOPRO_LANG = "sv"`
 | `--cpu-decode` | | decode on CPU instead of NVDEC |
 | `--encode-extra` | | e.g. `"-temporal-aq 1"` |
 | `--audio-stream` / `--audio-bitrate` / `--audio-curve` | `0` / `192k` / `tri` | |
+| `--clip-audio` | `retime` | default `audio=` mode for every row |
 | `--make-list FILE` / `--rows N` | | write a starter clips list and exit |
 | `--work-dir` / `--keep-work` (`--keep-temp`) | `<output>_work` | |
 | `--dry-run` / `-v` | | plan and ffmpeg commands |
@@ -341,6 +358,9 @@ luma encodes the frame number:
 - every supported speed from 6x down to 0.12x, checked for exact output length
   and for the source frame each output frame lands on (no drift), plus clips at
   different speeds meeting at a transition
+- all three `audio=` modes, checked acoustically: a frequency sweep confirms that
+  `retime` compresses or stretches it, that `keep` leaves the pitch alone and
+  truncates or loops, and that `mute` is silent
 
 Twenty-two cases run as a suite, each checked for exact frame count,
 frame-by-frame content against the sources, no frozen runs, and audio matching

@@ -32,10 +32,26 @@ Times are seconds (`1.5`) or frames (`45f`).
 | `--head 0` / `--tail 0` | cut from the start / end of every clip first |
 | `--fade-in` / `--fade-out` | fade from / to black at the very start / end |
 | `--transition fade` | any xfade transition; `fade`, `dissolve`, `fadeblack` suit 360° best |
-| `--list clips.txt` | per-clip control and ranges (see below) |
+| `--list clips.txt` | per-clip control, ranges and an `out=` typo guard (see below) |
 
 A transition never uses more than 40 % of either clip; longer values are
 shortened with a warning.
+
+### Generating the list file
+
+Rather than typing paths by hand, let the tool write a starter list you then edit:
+
+```powershell
+# one row per file, each with its length as a comment
+python xfade_concat.py --make-list clips.txt GS01*-png_ovr.mp4
+
+# 12 range rows spread through one master, ready to have the times replaced
+python xfade_concat.py --make-list clips.txt ..\GS00080-85_png_ovr.mp4 --rows 12
+```
+
+The file it writes carries the column reference and the exact command to run in
+its own header, so there is nothing to look up while editing. Add `-y` to
+overwrite an existing list.
 
 ### Per-clip control
 
@@ -71,9 +87,22 @@ those in, point the list file at the master and give each highlight a range:
 ../GS00080-85_png_ovr.mp4     in=00:03:24  out=00:03:36
 ```
 
-`in=` is where the highlight starts, `dur=` how long it runs (`out=` gives an end
-time instead). Times are `12`, `1:30` or `00:04:30.5`. The same file may be
-listed as many times as you like.
+`in=` is where the highlight starts and `dur=` how long it runs. Times are `12`,
+`1:30` or `00:04:30.5`, and the same file may be listed as many times as you like.
+
+`out=` is the end point. Give it **together with** `dur=` and it acts as a typo
+guard: the run stops before anything is encoded if the two disagree.
+
+```text
+../GS00080-85_png_ovr.mp4     in=00:29:04  dur=00:00:20  out=00:29:24
+```
+
+```
+error: clips.txt:7: in=0:29:04.000 + dur=0:00:20.000 ends at 0:29:24.000,
+       but out=0:29:14.000 - fix the line (nothing has been encoded yet)
+```
+
+Given on its own, `out=` simply sets the end instead of `dur=`.
 
 This is worth preferring, because pre-cutting with `-c copy` costs real quality
 of life:
@@ -160,7 +189,9 @@ interrupted run resumes where it stopped (`--keep-work` keeps them after success
 
 Probing never decodes: clip lengths, keyframes and pre-roll all come from
 timestamps and bitstream headers. On 8K footage that is the difference between
-seconds and minutes per file.
+seconds and minutes per file. Piece frame counts are likewise read straight from
+the Annex B start codes in one pass, rather than by asking ffprobe to parse every
+NAL unit (~20x slower, and it adds up over a job).
 
 ## Where it fits in the pipeline
 
@@ -224,6 +255,7 @@ Messages are English or Swedish: `--lang en|sv`, or `$env:GOPRO_LANG = "sv"`
 | `--cpu-decode` | | decode on CPU instead of NVDEC |
 | `--encode-extra` | | e.g. `"-temporal-aq 1"` |
 | `--audio-stream` / `--audio-bitrate` / `--audio-curve` | `0` / `192k` / `tri` | |
+| `--make-list FILE` / `--rows N` | | write a starter clips list and exit |
 | `--work-dir` / `--keep-work` (`--keep-temp`) | `<output>_work` | |
 | `--dry-run` / `-v` | | plan and ffmpeg commands |
 

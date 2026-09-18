@@ -38,7 +38,7 @@ from dataclasses import dataclass, field, replace
 from fractions import Fraction
 from pathlib import Path
 
-__version__ = "0.3.0"
+__version__ = "0.3.2"
 
 GOPRO_RE = re.compile(r"^G([A-Z])(\d{2})(\d{4})", re.IGNORECASE)
 RENUMBER = "setpts=N/FRAME_RATE/TB"  # hw-frame safe (touches timestamps only)
@@ -97,6 +97,18 @@ MESSAGES = {
         "err_not_file": "not a file: {path}",
         "err_no_video": "no video stream in {path}",
         "err_no_inputs": "need at least one input clip",
+        "err_no_output": "-o/--output is required",
+        "tpl_header": "# Clips list for xfade_concat {v} - edit the rows below, then run:",
+        "tpl_run": "#   python xfade_concat.py --list {name} -o {out} --fade-in 1 --fade-out 1",
+        "tpl_cols1": "# Columns (everything after the path is optional):",
+        "tpl_cols2": "#   in=   start in the file      dur=  how long it runs",
+        "tpl_cols3": "#   out=  end point - checked against in+dur before anything is encoded",
+        "tpl_cols4": "#   head= trim from the start    tail= trim from the end"
+                     "    fade= transition into the NEXT clip",
+        "tpl_master": "# {name} is {len} long. Replace the times below with your highlights.",
+        "tpl_out_note": "# If you change in= or dur=, update out= to match (or delete it).",
+        "tpl_files": "# {n} file(s), full length each. Add in=/dur= to use only part of one.",
+        "tpl_done": "Wrote {file} with {n} row(s) - open it, edit, then run the command at the top.",
         "err_list_and_inputs": "use either --list or input files, not both",
         "err_mismatch": "{a}: {wa}x{ha}@{fa} differs from {b}: {wb}x{hb}@{fb}",
         "err_channels": "audio channel counts differ between clips: {ch}",
@@ -107,7 +119,8 @@ MESSAGES = {
         "err_frames": "{name}: expected {want} frames, got {got}",
         "err_list_kv": "{file}:{line}: expected key=value, got '{tok}'",
         "err_list_key": "{file}:{line}: unknown option '{key}' (in/dur/out/head/tail/fade)",
-        "err_list_dur_out": "{file}:{line}: use either dur= or out=, not both",
+        "err_out_mismatch": "{file}:{line}: {name}: in={ins} + dur={dur} ends at {implied}, "
+                            "but out={stated} - fix the line (nothing has been encoded yet)",
         "err_range": "{name}: the in/dur/out range does not fit in the clip ({length:.3f}s long)",
     },
     "sv": {
@@ -147,6 +160,18 @@ MESSAGES = {
         "err_not_file": "ingen fil: {path}",
         "err_no_video": "ingen videoström i {path}",
         "err_no_inputs": "behöver minst ett klipp",
+        "err_no_output": "-o/--output krävs",
+        "tpl_header": "# Klipplista för xfade_concat {v} - redigera raderna nedan och kör sedan:",
+        "tpl_run": "#   python xfade_concat.py --list {name} -o {out} --lang sv --fade-in 1 --fade-out 1",
+        "tpl_cols1": "# Kolumner (allt efter sökvägen är valfritt):",
+        "tpl_cols2": "#   in=   start i filen          dur=  hur länge det pågår",
+        "tpl_cols3": "#   out=  slutpunkt - kontrolleras mot in+dur innan något kodas",
+        "tpl_cols4": "#   head= klipp bort i början    tail= klipp bort i slutet"
+                     "    fade= övergång till NÄSTA klipp",
+        "tpl_master": "# {name} är {len} lång. Byt ut tiderna nedan mot dina höjdpunkter.",
+        "tpl_out_note": "# Ändrar du in= eller dur= måste out= uppdateras (eller tas bort).",
+        "tpl_files": "# {n} fil(er), hela längden var. Lägg till in=/dur= för att bara ta en del.",
+        "tpl_done": "Skrev {file} med {n} rad(er) - öppna den, redigera, kör sedan kommandot högst upp.",
         "err_list_and_inputs": "använd antingen --list eller filnamn, inte båda",
         "err_mismatch": "{a}: {wa}x{ha}@{fa} skiljer sig från {b}: {wb}x{hb}@{fb}",
         "err_channels": "antal ljudkanaler skiljer mellan klippen: {ch}",
@@ -157,7 +182,8 @@ MESSAGES = {
         "err_frames": "{name}: väntade {want} rutor, fick {got}",
         "err_list_kv": "{file}:{line}: väntade nyckel=värde, fick '{tok}'",
         "err_list_key": "{file}:{line}: okänt alternativ '{key}' (in/dur/out/head/tail/fade)",
-        "err_list_dur_out": "{file}:{line}: använd antingen dur= eller out=, inte båda",
+        "err_out_mismatch": "{file}:{line}: {name}: in={ins} + dur={dur} slutar {implied}, "
+                            "men out={stated} - rätta raden (inget är kodat än)",
         "err_range": "{name}: intervallet in/dur/out får inte plats i klippet ({length:.3f}s långt)",
     },
 }
@@ -268,6 +294,8 @@ class Clip:
     in_raw: str | None = None
     dur_raw: str | None = None
     out_raw: str | None = None
+    row_file: str = ""
+    row_line: str = ""
     label: str = ""          # file name, plus the range when one was given
     raw_offset: float = 0.0  # raw_time = edited_time + raw_offset (edit-list shift)
     out_start: int = 0
@@ -449,8 +477,8 @@ def read_list_file(list_path: Path) -> list[tuple[Path, dict]]:
             if k not in ("head", "tail", "fade", "in", "dur", "out"):
                 die("err_list_key", file=list_path, line=lineno, key=k)
             opts[k] = parse_clock(val) if k in ("in", "dur", "out") else val
-        if "dur" in opts and "out" in opts:
-            die("err_list_dur_out", file=list_path, line=lineno)
+        opts["_line"] = str(lineno)
+        opts["_file"] = str(list_path)
         rows.append((p, opts))
     return rows
 
@@ -496,7 +524,18 @@ def assign_trims(clips: list[Clip], args, fps: Fraction) -> None:
         if c.in_raw is not None:
             c.head = parse_time(c.in_raw, fps, f"in ({c.path.name})")
         if c.dur_raw is not None:
-            c.tail = c.frames - c.head - parse_time(c.dur_raw, fps, f"dur ({c.path.name})")
+            end = c.head + parse_time(c.dur_raw, fps, f"dur ({c.path.name})")
+            if c.out_raw is not None:
+                # out= alongside dur= is a typo guard: both must describe the same
+                # end point, and a disagreement stops the run before anything is
+                # encoded. One frame of slack absorbs clock/frame rounding.
+                stated = parse_time(c.out_raw, fps, f"out ({c.path.name})")
+                if abs(end - stated) > 1:
+                    die("err_out_mismatch", file=c.row_file, line=c.row_line,
+                        name=c.path.name, ins=hms(secs(c.head, fps)),
+                        dur=hms(secs(end - c.head, fps)),
+                        implied=hms(secs(end, fps)), stated=hms(secs(stated, fps)))
+            c.tail = c.frames - end
         elif c.out_raw is not None:
             c.tail = c.frames - parse_time(c.out_raw, fps, f"out ({c.path.name})")
         if c.tail < 0:
@@ -739,6 +778,40 @@ def audio_cmd(args, clips: list[Clip], fps: Fraction, total: int, fade_in: int,
                   "-c:a", "aac", "-b:a", args.audio_bitrate, "-f", "mp4", str(out)]
 
 
+def annexb_frames(path: Path) -> int:
+    """Count frames in a raw Annex B piece, exactly and in one pass.
+
+    A picture starts at the VCL NAL unit whose first_slice_segment_in_pic_flag
+    is set - the top bit of the first byte after the 2-byte NAL header. Scanning
+    for start codes with bytes.find runs at memchr speed; letting ffprobe count
+    packets instead parses every NAL and is ~20x slower, which on 8K pieces is
+    minutes rather than seconds across a whole job."""
+    count = 0
+    carry = b""
+    base = 0   # absolute offset of carry[0]
+    done = 0   # absolute offset already accounted for
+    with open(path, "rb") as fh:
+        while True:
+            chunk = fh.read(1 << 23)
+            if not chunk:
+                break
+            buf = carry + chunk
+            i = 0
+            while True:
+                i = buf.find(b"\x00\x00\x01", i)
+                if i < 0 or i + 6 > len(buf):
+                    break
+                if base + i >= done:
+                    if ((buf[i + 3] >> 1) & 0x3F) < 32 and (buf[i + 5] & 0x80):
+                        count += 1
+                    done = base + i + 1
+                i += 3
+            keep = min(len(buf), 6)
+            carry = buf[-keep:]
+            base += len(buf) - keep
+    return count
+
+
 def piece_key(p: Piece, clips: list[Clip], enc: Enc) -> str:
     def src(i):
         c = clips[i]
@@ -749,6 +822,65 @@ def piece_key(p: Piece, clips: list[Clip], enc: Enc) -> str:
             "tr": enc.args.transition, "enc": enc.video_args, "bsf": enc.enc_bsf,
             "hw": enc.hw, "ts": enc.timescale, "v": __version__}
     return hashlib.sha1(json.dumps(spec, sort_keys=True).encode()).hexdigest()[:10]
+
+
+def clock(seconds: float) -> str:
+    """HH:MM:SS for the list file, with decimals only when they matter."""
+    h, rem = divmod(float(seconds), 3600)
+    m, sec = divmod(rem, 60)
+    if abs(sec - round(sec)) < 5e-4:
+        return f"{int(h):02d}:{int(m):02d}:{int(round(sec)):02d}"
+    return f"{int(h):02d}:{int(m):02d}:{sec:06.3f}".rstrip("0")
+
+
+def make_list(args) -> None:
+    """Write a clips list the user can open and edit, instead of typing paths."""
+    paths = expand_inputs(args.inputs)
+    if not paths:
+        die("err_no_inputs")
+    dest = Path(args.make_list)
+    if dest.exists() and not args.overwrite:
+        die("err_exists", out=dest)
+
+    print(t("probing", n=len(paths)))
+    clips = [probe_clip(args.ffprobe, p) for p in paths]
+    c0 = clips[0]
+    ref = dest.resolve().parent
+
+    def rel(path: Path) -> str:
+        try:
+            return os.path.relpath(path, ref).replace("\\", "/")
+        except ValueError:       # different drive on Windows
+            return str(path)
+
+    lines = [t("tpl_header", v=__version__),
+             t("tpl_run", out="montage.mp4", name=dest.name),
+             "#",
+             t("tpl_cols1"), t("tpl_cols2"), t("tpl_cols3"), t("tpl_cols4"), "#"]
+
+    if args.rows:
+        # range rows through one master: evenly spaced starting points, so every
+        # row is valid as written and only the numbers need changing
+        span = secs(c0.frames, c0.fps)
+        lines.append(t("tpl_master", name=c0.path.name, len=clock(span)))
+        lines.append(t("tpl_out_note"))
+        lines.append("#")
+        step = span / (args.rows + 1)
+        length = min(12.0, max(2.0, step / 2))
+        for i in range(args.rows):
+            start = step * (i + 1)
+            lines.append(f"{rel(c0.path):<30} in={clock(start)}  dur={clock(length)}  "
+                         f"out={clock(start + length)}")
+    else:
+        lines.append(t("tpl_files", n=len(clips)))
+        lines.append("#")
+        width = max(len(rel(c.path)) for c in clips)
+        for c in clips:
+            lines.append(f"{rel(c.path):<{width}}   # {secs(c.frames, c.fps):.2f} s")
+
+    dest.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    rows = sum(1 for ln in lines if not ln.startswith("#"))
+    print(t("tpl_done", file=dest, n=rows))
 
 
 # --------------------------------------------------------------------------- #
@@ -763,8 +895,13 @@ def main() -> None:
                     "stream-copies the clip bodies and re-encodes only the transitions "
                     "with NVENC. Times: seconds (1.5) or frames (45f).")
     ap.add_argument("inputs", nargs="*", help="input clips (wildcards are expanded)")
-    ap.add_argument("-o", "--output", required=True, help="output .mp4")
+    ap.add_argument("-o", "--output", help="output .mp4 (not needed with --make-list)")
     ap.add_argument("-y", "--overwrite", action="store_true", help="overwrite output")
+    ap.add_argument("--make-list", type=Path, metavar="FILE",
+                    help="write a ready-to-edit clips list for the given inputs and exit")
+    ap.add_argument("--rows", type=int, default=0, metavar="N",
+                    help="--make-list: N range rows through a single master instead of "
+                         "one row per file")
     ap.add_argument("--list", type=Path,
                     help="text file: '<path> [head=..] [tail=..] [fade=..]' per line")
     ap.add_argument("--lang", choices=["en", "sv"], default=env_lang if env_lang in MESSAGES else "en",
@@ -835,6 +972,12 @@ def main() -> None:
     if args.encoder == "x265":
         args.cpu_decode = True
 
+    if args.make_list:
+        make_list(args)
+        return
+
+    if not args.output:
+        die("err_no_output")
     output = Path(args.output).resolve()
     if output.exists() and not args.overwrite and not args.dry_run:
         die("err_exists", out=output)
@@ -862,6 +1005,7 @@ def main() -> None:
     for c, o in zip(clips, overrides):
         c.head_raw, c.tail_raw, c.fade_raw = o.get("head"), o.get("tail"), o.get("fade")
         c.in_raw, c.dur_raw, c.out_raw = o.get("in"), o.get("dur"), o.get("out")
+        c.row_file, c.row_line = o.get("_file", ""), o.get("_line", "")
     if not args.list and not args.no_sort and all(c.gopro for c in clips):
         clips.sort(key=lambda c: (c.gopro[0], c.gopro[2], c.gopro[1]))
 
@@ -997,25 +1141,16 @@ def main() -> None:
 
     work.mkdir(parents=True, exist_ok=True)
 
-    def piece_frames(path: Path) -> int:
-        """Frames in a raw Annex B piece. One packet = one access unit = one
-        frame, and there is no container metadata that could disagree, so this
-        is both exact and demux-only (no decoding)."""
-        info = ffprobe_json(args.ffprobe, ["-f", "hevc", "-select_streams", "v:0",
-                                           "-count_packets",
-                                           "-show_entries", "stream=nb_read_packets"], path)
-        return int(info["streams"][0].get("nb_read_packets") or 0)
-
     # ---- video pieces, serially (one NVDEC/NVENC chip; parallel jobs corrupt frames)
     for idx, p in enumerate(pieces):
         head = f"[{idx + 1}/{len(pieces)}] {label(p)}"
-        if p.file.exists() and piece_frames(p.file) == p.frames:
+        if p.file.exists() and annexb_frames(p.file) == p.frames:
             print(head + t("cached"))
             continue
         print(head)
         tmp = p.file.with_name(p.file.stem + ".partial.hevc")
         run(enc.piece_cmd(p, clips, tmp), args.verbose)
-        got = piece_frames(tmp)
+        got = annexb_frames(tmp)
         if got != p.frames:
             print(t("err_frames", name=tmp.name, want=p.frames, got=got), file=sys.stderr)
             sys.exit(1)

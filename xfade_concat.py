@@ -38,7 +38,7 @@ from dataclasses import dataclass, field, replace
 from fractions import Fraction
 from pathlib import Path
 
-__version__ = "0.3.2"
+__version__ = "0.4.0"
 
 GOPRO_RE = re.compile(r"^G([A-Z])(\d{2})(\d{4})", re.IGNORECASE)
 RENUMBER = "setpts=N/FRAME_RATE/TB"  # hw-frame safe (touches timestamps only)
@@ -98,6 +98,9 @@ MESSAGES = {
         "err_no_video": "no video stream in {path}",
         "err_no_inputs": "need at least one input clip",
         "err_no_output": "-o/--output is required",
+        "err_speed": "{name}: invalid speed '{val}' (e.g. 2, 1.5, 0.5, 1/3)",
+        "err_speed_range": "{name}: speed {val} is outside the supported 0.02-50 range",
+        "err_speed_short": "{name}: nothing left of this clip at speed {val}",
         "tpl_header": "# Clips list for xfade_concat {v} - edit the rows below, then run:",
         "tpl_run": "#   python xfade_concat.py --list {name} -o {out} --fade-in 1 --fade-out 1",
         "tpl_cols1": "# Columns (everything after the path is optional):",
@@ -105,8 +108,10 @@ MESSAGES = {
         "tpl_cols3": "#   out=  end point - checked against in+dur before anything is encoded",
         "tpl_cols4": "#   head= trim from the start    tail= trim from the end"
                      "    fade= transition into the NEXT clip",
+        "tpl_cols5": "#   speed= 2 plays twice as fast, 0.5 half as fast (1.5, 3, 4, 6, "
+                     "0.67, 0.33, 0.25, 0.12 ...)",
         "tpl_master": "# {name} is {len} long. Replace the times below with your highlights.",
-        "tpl_out_note": "# If you change in= or dur=, update out= to match (or delete it).",
+        "tpl_out_note": "# Add out=<end> to a row to have it checked against in+dur before encoding.",
         "tpl_files": "# {n} file(s), full length each. Add in=/dur= to use only part of one.",
         "tpl_done": "Wrote {file} with {n} row(s) - open it, edit, then run the command at the top.",
         "err_list_and_inputs": "use either --list or input files, not both",
@@ -161,6 +166,9 @@ MESSAGES = {
         "err_no_video": "ingen videoström i {path}",
         "err_no_inputs": "behöver minst ett klipp",
         "err_no_output": "-o/--output krävs",
+        "err_speed": "{name}: ogiltig hastighet '{val}' (t.ex. 2, 1.5, 0.5, 1/3)",
+        "err_speed_range": "{name}: hastigheten {val} ligger utanför intervallet 0.02-50",
+        "err_speed_short": "{name}: inget kvar av klippet vid hastighet {val}",
         "tpl_header": "# Klipplista för xfade_concat {v} - redigera raderna nedan och kör sedan:",
         "tpl_run": "#   python xfade_concat.py --list {name} -o {out} --lang sv --fade-in 1 --fade-out 1",
         "tpl_cols1": "# Kolumner (allt efter sökvägen är valfritt):",
@@ -168,8 +176,10 @@ MESSAGES = {
         "tpl_cols3": "#   out=  slutpunkt - kontrolleras mot in+dur innan något kodas",
         "tpl_cols4": "#   head= klipp bort i början    tail= klipp bort i slutet"
                      "    fade= övergång till NÄSTA klipp",
+        "tpl_cols5": "#   speed= 2 spelar dubbelt så fort, 0.5 hälften så fort (1.5, 3, 4, 6, "
+                     "0.67, 0.33, 0.25, 0.12 ...)",
         "tpl_master": "# {name} är {len} lång. Byt ut tiderna nedan mot dina höjdpunkter.",
-        "tpl_out_note": "# Ändrar du in= eller dur= måste out= uppdateras (eller tas bort).",
+        "tpl_out_note": "# Lägg till out=<slut> på en rad för att få den kontrollerad mot in+dur.",
         "tpl_files": "# {n} fil(er), hela längden var. Lägg till in=/dur= för att bara ta en del.",
         "tpl_done": "Skrev {file} med {n} rad(er) - öppna den, redigera, kör sedan kommandot högst upp.",
         "err_list_and_inputs": "använd antingen --list eller filnamn, inte båda",
@@ -296,10 +306,17 @@ class Clip:
     out_raw: str | None = None
     row_file: str = ""
     row_line: str = ""
+    speed_raw: str | None = None
+    speed: Fraction = Fraction(1)   # >1 plays faster, <1 slower
+    out_len: int = 0                # frames this clip contributes to the output
     label: str = ""          # file name, plus the range when one was given
     raw_offset: float = 0.0  # raw_time = edited_time + raw_offset (edit-list shift)
     out_start: int = 0
     keyframes: dict = field(default_factory=dict)  # idx -> Keyframe
+
+    def src_at(self, o: int) -> int:
+        """Source frame for an output-frame offset within this clip's kept range."""
+        return self.head + (o if self.speed == 1 else round(o * self.speed))
 
     @property
     def fdur_ticks(self) -> Fraction:
@@ -474,7 +491,7 @@ def read_list_file(list_path: Path) -> list[tuple[Path, dict]]:
                 die("err_list_kv", file=list_path, line=lineno, tok=tok)
             k, val = tok.split("=", 1)
             k = k.lower()
-            if k not in ("head", "tail", "fade", "in", "dur", "out"):
+            if k not in ("head", "tail", "fade", "in", "dur", "out", "speed"):
                 die("err_list_key", file=list_path, line=lineno, key=k)
             opts[k] = parse_clock(val) if k in ("in", "dur", "out") else val
         opts["_line"] = str(lineno)
@@ -549,6 +566,8 @@ def assign_trims(clips: list[Clip], args, fps: Fraction) -> None:
         c.label = c.path.name
         if c.in_raw is not None or c.dur_raw is not None or c.out_raw is not None:
             c.label = f"{c.path.name} @{hms(secs(c.head, fps))}"
+        if c.speed != 1:
+            c.label += f" {float(c.speed):g}x"
 
     if args.fades:
         vals = args.fades.split(",")
@@ -562,9 +581,28 @@ def assign_trims(clips: list[Clip], args, fps: Fraction) -> None:
         if c.frames - c.head - c.tail <= 0:
             die("err_trim", name=c.path.name, ht=secs(c.head + c.tail, fps),
                 length=secs(c.frames, fps))
+        if c.speed_raw is not None:
+            try:
+                c.speed = Fraction(str(c.speed_raw).strip())
+            except (ValueError, ZeroDivisionError):
+                die("err_speed", name=c.path.name, val=c.speed_raw)
+            if not (Fraction(1, 50) <= c.speed <= 50):
+                die("err_speed_range", name=c.path.name, val=c.speed_raw)
+        # everything downstream counts in output frames, which is where speed
+        # stops being a special case: a 20 s clip at 2x is simply a 10 s clip.
+        # The last output frame must map to a source frame that exists: output
+        # frame o reads source frame round(o * speed), and floor(n / speed) can
+        # still round past the end (n=250 at 0.5x wants source frame 250).
+        # Trim the length until the mapping fits.
+        kept = c.frames - c.head - c.tail
+        c.out_len = math.floor(Fraction(kept) / c.speed)
+        while c.out_len > 0 and round((c.out_len - 1) * c.speed) > kept - 1:
+            c.out_len -= 1
+        if c.out_len <= 0:
+            die("err_speed_short", name=c.path.name, val=str(c.speed))
     # like the original script: a transition may use at most 40 % of either clip
     for a, b in zip(clips, clips[1:]):
-        limit = math.floor(0.4 * min(a.frames - a.head - a.tail, b.frames - b.head - b.tail))
+        limit = math.floor(0.4 * min(a.out_len, b.out_len))
         if a.fade > limit:
             warn("warn_shorten", a=a.path.name, b=b.path.name, d=secs(limit, fps),
                  want=secs(a.fade, fps))
@@ -573,33 +611,42 @@ def assign_trims(clips: list[Clip], args, fps: Fraction) -> None:
 
 def build_plan(clips: list[Clip], fps: Fraction, fade_in: int, fade_out: int,
                smart: bool, min_copy: int) -> tuple[list[Piece], int]:
+    """Lay the clips out on the output timeline.
+
+    Positions inside a clip are counted in OUTPUT frames, and turned into source
+    frames only when a piece is emitted. That is what lets a clip play at a
+    different speed without the rest of the planner knowing about it: the fades
+    and transitions stay the length the viewer sees."""
     n = len(clips)
     pieces: list[Piece] = []
     cursor = 0
     for i, c in enumerate(clips):
-        s, e = c.head, c.frames - c.tail
+        total = c.out_len
         in_ov = clips[i - 1].fade if i else 0
         c.out_start = cursor - in_ov
-        c0 = s + in_ov
-        c1 = e - c.fade
+        o0, o1 = in_ov, total - c.fade
         fi = fade_in if i == 0 else 0
         fo = fade_out if i == n - 1 else 0
-        if c0 + fi > c1 - fo:
+        if o0 + fi > o1 - fo:
             die("err_fade_io", name=c.path.name)
 
-        def add(kind, src, frames, **kw):
+        def add(kind, o, frames, **kw):
             nonlocal cursor
             if frames > 0:
-                pieces.append(Piece(kind, i, src, frames, **kw))
+                pieces.append(Piece(kind, i, c.src_at(o), frames, **kw))
                 cursor += frames
 
-        add("enc", c0, fi, fade_in=True)
-        b0, b1 = c0 + fi, c1 - fo  # body
+        add("enc", o0, fi, fade_in=True)
+        b0, b1 = o0 + fi, o1 - fo  # body
         ks = ke = None
-        if smart and b1 > b0:
-            safe = sorted(k for k, kf in c.keyframes.items() if kf.safe)
-            ks = next((k for k in safe if k >= b0), None)
-            ends = [k for k in safe if k <= b1] + ([c.frames] if b1 == c.frames else [])
+        if smart and c.speed == 1 and b1 > b0:
+            # keyframes are source frame indices; at speed 1 an output offset is
+            # just that minus the head trim
+            safe = sorted(k - c.head for k, kf in c.keyframes.items() if kf.safe)
+            ks = next((k for k in safe if b0 <= k <= b1), None)
+            ends = [k for k in safe if k <= b1]
+            if c.tail == 0 and b1 == total:
+                ends.append(total)          # end of file is a safe cut point too
             ke = max(ends) if ends else None
             if ks is None or ke is None or ke - ks < min_copy:
                 ks = ke = None
@@ -611,7 +658,7 @@ def build_plan(clips: list[Clip], fps: Fraction, fade_in: int, fade_out: int,
             add("enc", ke, b1 - ke)
         add("enc", b1, fo, fade_out=True)
         if i < n - 1 and c.fade > 0:
-            add("xfade", e - c.fade, c.fade, clip_b=i + 1, src_b=clips[i + 1].head)
+            add("xfade", o1, c.fade, clip_b=i + 1, src_b=clips[i + 1].src_at(0))
     return pieces, cursor
 
 
@@ -689,6 +736,20 @@ class Enc:
             a += ["-ss", f"{t0:.6f}"]
         return a + ["-i", str(clip.path)]
 
+    def retime(self, clip: Clip) -> str:
+        """Filters that turn source frames into output frames for a sped clip.
+
+        setpts rescales the timeline; the fps filter then resamples to the output
+        rate, dropping frames when speeding up and repeating them when slowing
+        down (no interpolation - that would cost more than the encode itself at
+        8K). Empty at speed 1, so ordinary clips keep exactly the old chain."""
+        if clip.speed == 1:
+            return ""
+        num, den = clip.speed.numerator, clip.speed.denominator
+        # round=up makes output frame k land on source frame round(k*speed);
+        # the other modes bias the pick by up to half an output frame
+        return f",setpts=PTS*{den}/{num},fps={self.fps}:round=up"
+
     def to_cpu(self) -> str:
         if self.hw:
             return f"hwdownload,format={self.hwfmt},format={self.planar}"
@@ -724,8 +785,10 @@ class Enc:
         if p.kind == "enc":
             cmd = base + self.input_args(a, p.src)
             fades = self.fades(p)
-            if fades or (self.hw and self.args.encoder != "nvenc"):
-                chain = ",".join([RENUMBER, self.to_cpu(), *fades, f"format={self.encfmt}"])
+            retime = self.retime(a)
+            if fades or retime or (self.hw and self.args.encoder != "nvenc"):
+                chain = (RENUMBER + "," + self.to_cpu() + retime
+                         + "".join("," + f for f in fades) + f",format={self.encfmt}")
             else:
                 # renumber timestamps to exact frame slots: a seek landing half a frame
                 # in could otherwise make the CFR sync duplicate the first frame
@@ -734,14 +797,37 @@ class Enc:
         else:
             b = clips[p.clip_b]
             cmd = base + self.input_args(a, p.src) + self.input_args(b, p.src_b)
-            prep = f"trim=end_frame={p.frames},{RENUMBER},{self.to_cpu()},settb=AVTB"
-            graph = (f"[0:v:0]{prep}[a];[1:v:0]{prep}[b];"
+            def prep(clip: Clip) -> str:
+                # read enough source frames to cover the overlap at this speed,
+                # retime, then cut to exactly the frames the transition needs
+                need = math.ceil(p.frames * float(clip.speed)) + 2 if clip.speed != 1 else p.frames
+                c = f"trim=end_frame={need},{RENUMBER},{self.to_cpu()}{self.retime(clip)}"
+                if clip.speed != 1:
+                    c += f",trim=end_frame={p.frames},{RENUMBER}"
+                return c + ",settb=AVTB"
+            graph = (f"[0:v:0]{prep(a)}[a];[1:v:0]{prep(b)}[b];"
                      f"[a][b]xfade=transition={self.args.transition}:"
                      f"duration={fsec(p.frames, self.fps)}:offset=0,"
                      + ",".join([*self.fades(p), f"format={self.encfmt}"]) + "[v]")
             cmd += ["-filter_complex", graph, "-map", "[v]"]
         return cmd + ["-frames:v", str(p.frames), "-an", "-sn", "-dn", *self.video_args,
                       "-bsf:v", self.enc_bsf, "-f", "hevc", str(out)]
+
+
+def atempo_chain(speed: Fraction) -> str:
+    """atempo only accepts a limited factor per instance, so chain them."""
+    if speed == 1:
+        return ""
+    out = []
+    left = float(speed)
+    while left > 2.0:
+        out.append(2.0)
+        left /= 2.0
+    while left < 0.5:
+        out.append(0.5)
+        left /= 0.5
+    out.append(left)
+    return "".join(f",atempo={v:.6f}" for v in out)
 
 
 def audio_cmd(args, clips: list[Clip], fps: Fraction, total: int, fade_in: int,
@@ -756,7 +842,9 @@ def audio_cmd(args, clips: list[Clip], fps: Fraction, total: int, fade_in: int,
         s = c.v_start + secs(c.head, fps)
         e = c.v_start + secs(c.frames - c.tail, fps)
         parts.append(f"[{i}:a:{args.audio_stream}]aresample=48000:async=1:first_pts=0,{afmt},"
-                     f"apad,atrim=start={s:.9f}:end={e:.9f},asetpts=PTS-STARTPTS[a{i}]")
+                     f"apad,atrim=start={s:.9f}:end={e:.9f},asetpts=PTS-STARTPTS"
+                     f"{atempo_chain(c.speed)},apad,"
+                     f"atrim=end={fsec(c.out_len, fps)},asetpts=PTS-STARTPTS[a{i}]")
     cur = "a0"
     for i in range(1, len(clips)):
         d = clips[i - 1].fade
@@ -820,6 +908,8 @@ def piece_key(p: Piece, clips: list[Clip], enc: Enc) -> str:
     spec = {"p": [p.kind, p.src, p.frames, p.src_b, p.fade_in, p.fade_out],
             "a": src(p.clip), "b": src(p.clip_b) if p.clip_b is not None else None,
             "tr": enc.args.transition, "enc": enc.video_args, "bsf": enc.enc_bsf,
+            "sp": [str(clips[p.clip].speed),
+                   str(clips[p.clip_b].speed) if p.clip_b is not None else None],
             "hw": enc.hw, "ts": enc.timescale, "v": __version__}
     return hashlib.sha1(json.dumps(spec, sort_keys=True).encode()).hexdigest()[:10]
 
@@ -856,21 +946,18 @@ def make_list(args) -> None:
     lines = [t("tpl_header", v=__version__),
              t("tpl_run", out="montage.mp4", name=dest.name),
              "#",
-             t("tpl_cols1"), t("tpl_cols2"), t("tpl_cols3"), t("tpl_cols4"), "#"]
+             t("tpl_cols1"), t("tpl_cols2"), t("tpl_cols3"), t("tpl_cols4"),
+             t("tpl_cols5"), "#"]
 
     if args.rows:
         # range rows through one master: evenly spaced starting points, so every
         # row is valid as written and only the numbers need changing
-        span = secs(c0.frames, c0.fps)
-        lines.append(t("tpl_master", name=c0.path.name, len=clock(span)))
+        lines.append(t("tpl_master", name=c0.path.name, len=clock(secs(c0.frames, c0.fps))))
         lines.append(t("tpl_out_note"))
         lines.append("#")
-        step = span / (args.rows + 1)
-        length = min(12.0, max(2.0, step / 2))
-        for i in range(args.rows):
-            start = step * (i + 1)
-            lines.append(f"{rel(c0.path):<30} in={clock(start)}  dur={clock(length)}  "
-                         f"out={clock(start + length)}")
+        lines.append("")
+        for _ in range(args.rows):
+            lines.append(f"{rel(c0.path):<30} in=00:00:00  dur=00:00:12")
     else:
         lines.append(t("tpl_files", n=len(clips)))
         lines.append("#")
@@ -1006,6 +1093,7 @@ def main() -> None:
         c.head_raw, c.tail_raw, c.fade_raw = o.get("head"), o.get("tail"), o.get("fade")
         c.in_raw, c.dur_raw, c.out_raw = o.get("in"), o.get("dur"), o.get("out")
         c.row_file, c.row_line = o.get("_file", ""), o.get("_line", "")
+        c.speed_raw = o.get("speed")
     if not args.list and not args.no_sort and all(c.gopro for c in clips):
         clips.sort(key=lambda c: (c.gopro[0], c.gopro[2], c.gopro[1]))
 
@@ -1068,7 +1156,7 @@ def main() -> None:
     if smart:
         for i, c in enumerate(clips):
             body = [p for p in pieces if p.clip == i and p.kind != "xfade"]
-            if any(p.kind == "copy" for p in body):
+            if any(p.kind == "copy" for p in body) or c.speed != 1:
                 continue
             span = sum(p.frames for p in body)
             if span <= 2 * min_copy:
@@ -1111,13 +1199,15 @@ def main() -> None:
         "output_duration_s": secs(total, fps),
         "copied_s": secs(copy_f, fps),
         "reencoded_s": secs(total - copy_f, fps),
-        "mapping": "out_t = out_start_s + (src_t - src_in_s)   for src_in_s <= src_t < src_out_s",
+        "mapping": "out_t = out_start_s + (src_t - src_in_s) / speed"
+                   "   for src_in_s <= src_t < src_out_s",
         "clips": [{
             "file": str(c.path),
             "src_in_s": secs(c.head, fps),
             "src_out_s": secs(c.frames - c.tail, fps),
+            "speed": float(c.speed),
             "out_start_s": secs(c.out_start, fps),
-            "out_end_s": secs(c.out_start + c.frames - c.head - c.tail, fps),
+            "out_end_s": secs(c.out_start + c.out_len, fps),
             "fade_from_prev_s": secs(clips[i - 1].fade, fps) if i else 0.0,
             "fade_to_next_s": secs(c.fade, fps),
         } for i, c in enumerate(clips)],

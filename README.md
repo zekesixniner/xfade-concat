@@ -32,7 +32,7 @@ Times are seconds (`1.5`) or frames (`45f`).
 | `--head 0` / `--tail 0` | cut from the start / end of every clip first |
 | `--fade-in` / `--fade-out` | fade from / to black at the very start / end |
 | `--transition fade` | any xfade transition; `fade`, `dissolve`, `fadeblack` suit 360° best |
-| `--list clips.txt` | per-clip control, ranges and an `out=` typo guard (see below) |
+| `--list clips.txt` | per-clip control, ranges, speed and an `out=` typo guard (see below) |
 
 A transition never uses more than 40 % of either clip; longer values are
 shortened with a warning.
@@ -66,6 +66,31 @@ master.mp4                 in=00:01:24 dur=24
 `fade` on a line is the transition **into the next** clip. `in`/`dur`/`out` pick
 a stretch of the file (see below). Relative paths are relative to the list file,
 and the order is exactly as written.
+
+### Playback speed
+
+`speed=` plays a clip faster or slower:
+
+```text
+master.mp4   in=00:12:30  dur=00:04:00  speed=6      # cruise, compressed
+master.mp4   in=00:41:10  dur=00:00:08  speed=0.25   # the landing, in detail
+```
+
+Above 1 it runs faster (`1.5`, `2`, `3`, `4`, `6`), below 1 slower (`0.67`, `0.5`,
+`0.33`, `0.25`, `0.12`); fractions like `1/3` work too. A 4 minute stretch at
+`speed=6` becomes 40 seconds of output.
+
+Everything else stays in the time the viewer sees: `--fade 1.5` is still 1.5
+seconds on screen, whatever speeds meet at that junction, and two clips at
+different speeds cross-fade correctly. `in`/`dur`/`head`/`tail` stay in source
+time — you pick the stretch first, and the speed applies to it.
+
+Speeding up drops frames and slowing down repeats them; there is no motion
+interpolation, which at 8K would cost far more than the encode itself. Audio is
+retimed with `atempo`, chained for the extreme ratios; stretched far enough it
+will sound like it, so `--no-audio` or a music bed is often the better answer for
+big slow-motion sections. A clip with `speed=` is always re-encoded, since there
+is nothing to copy when every frame moves.
 
 ### GoPro chapters
 
@@ -313,8 +338,12 @@ luma encodes the frame number:
   `--zones`) — the case that produced frozen frames and a short output when
   pieces were still joined as MP4
 - ranges taken straight from a master (`in=`/`dur=`), and piece caching/resume
+- every supported speed from 6x down to 0.12x, checked for exact output length
+  and for the source frame each output frame lands on (no drift), plus clips at
+  different speeds meeting at a transition
 
-Twelve cases run as a suite, each checked for exact frame count, frame-by-frame
-content against the sources, no frozen runs, and audio matching video length.
+Twenty-two cases run as a suite, each checked for exact frame count,
+frame-by-frame content against the sources, no frozen runs, and audio matching
+video length.
 
 The NVENC/NVDEC path itself needs testing on the GPU machine.

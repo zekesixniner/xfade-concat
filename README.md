@@ -32,7 +32,7 @@ Times are seconds (`1.5`) or frames (`45f`).
 | `--head 0` / `--tail 0` | cut from the start / end of every clip first |
 | `--fade-in` / `--fade-out` | fade from / to black at the very start / end |
 | `--transition fade` | any xfade transition; `fade`, `dissolve`, `fadeblack` suit 360° best |
-| `--list clips.txt` | per-clip control, ranges, speed and an `out=` typo guard (see below) |
+| `--list clips.txt` | per-clip control, ranges, speed, chapter titles and an `out=` typo guard (see below) |
 
 A transition never uses more than 40 % of either clip; longer values are
 shortened with a warning.
@@ -324,6 +324,40 @@ Written next to the output as `<output>.timeline.json`:
 
 A source time maps to the output as `out_t = out_start_s + (src_t - src_in_s)`.
 
+## YouTube chapters
+
+Next to the video the tool writes `<output>.chapters.txt`, ready to paste into
+the YouTube description:
+
+```text
+0:00 Take off ESMK
+   Speed 1× · 20 s · GS00080-85_png_ovr.mp4 0m05s–0m25s
+0:20 Cruise over Skåne
+   Speed 4× · 10 s on screen from 40 s recorded · GS00080-85_png_ovr.mp4 0m30s–1m10s
+0:28 Landing RWY 01
+   Speed 0.5× · 16 s on screen from 8 s recorded · GS00080-85_png_ovr.mp4 1m15s–1m23s · original audio
+```
+
+One chapter per clip. Titles come from `title="..."` in the list file, or are left
+as `<TITLE>` placeholders to fill in. Each chapter starts where the transition
+into its clip has finished, so a click lands on the new picture rather than the
+blend. The file is written as soon as the plan is ready — before encoding — so
+the description can be prepared while the video renders; `--dry-run` prints it.
+
+Under each chapter is a line with the speed, how long the clip runs on screen
+(and how much recording it covers, when sped up or slowed down), and where in
+which file it was taken. Those source positions are written as `14m57s`, never
+`14:57`: YouTube turns anything shaped like `14:57` in a description into a
+timestamp, and one out of order between the chapters makes it drop the whole
+chapter list.
+
+YouTube only shows chapters when the first is `0:00`, there are at least three,
+and **every one lasts 10 seconds or more**. Transitions eat into that from both
+sides — a 12 s clip with 1.5 s fades is a chapter of about 10.5 s — so the tool
+warns about any chapter that falls short. Deleting that chapter's two lines from
+the text file folds it into the one before; a longer `dur=` or a shorter `fade=`
+on that row fixes it at the source.
+
 ## 360° video
 
 ffmpeg drops the spherical metadata. Run `inject360-inplace` on the output as
@@ -358,6 +392,8 @@ luma encodes the frame number:
 - every supported speed from 6x down to 0.12x, checked for exact output length
   and for the source frame each output frame lands on (no drift), plus clips at
   different speeds meeting at a transition
+- chapter positions checked against the rendered picture: each one lands on the
+  frame where the new clip is fully in view
 - all three `audio=` modes, checked acoustically: a frequency sweep confirms that
   `retime` compresses or stretches it, that `keep` leaves the pitch alone and
   truncates or loops, and that `mute` is silent

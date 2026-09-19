@@ -38,7 +38,7 @@ from dataclasses import dataclass, field, replace
 from fractions import Fraction
 from pathlib import Path
 
-__version__ = "0.4.1"
+__version__ = "0.5.0"
 
 GOPRO_RE = re.compile(r"^G([A-Z])(\d{2})(\d{4})", re.IGNORECASE)
 RENUMBER = "setpts=N/FRAME_RATE/TB"  # hw-frame safe (touches timestamps only)
@@ -98,6 +98,16 @@ MESSAGES = {
         "err_no_video": "no video stream in {path}",
         "err_no_inputs": "need at least one input clip",
         "err_no_output": "-o/--output is required",
+        "yt_title_placeholder": "<TITLE>",
+        "yt_speed": "Speed",
+        "yt_len": "{on}",
+        "yt_len_sped": "{on} on screen from {rec} recorded",
+        "yt_audio_keep": "original audio",
+        "yt_audio_mute": "muted",
+        "yt_short": "note: chapter {n} ({stamp}) lasts only {s} s - YouTube needs every "
+                    "chapter to be 10 s or longer, or it shows none of them",
+        "yt_few": "note: only {n} clip(s) - YouTube shows chapters from 3 upwards",
+        "yt_written": "YouTube chapters: {file}",
         "err_audio_mode": "{name}: unknown audio mode '{val}' (retime, keep or mute)",
         "err_speed": "{name}: invalid speed '{val}' (e.g. 2, 1.5, 0.5, 1/3)",
         "err_speed_range": "{name}: speed {val} is outside the supported 0.02-50 range",
@@ -113,6 +123,8 @@ MESSAGES = {
                      "0.67, 0.33, 0.25, 0.12 ...)",
         "tpl_cols6": "#   audio= retime (follows speed, default) | keep (normal pitch, "
                      "truncated or looped) | mute",
+        "tpl_cols7": "#   title=\"Take off ESMK\"  chapter title in the YouTube text "
+                     "written next to the video",
         "tpl_master": "# {name} is {len} long. Replace the times below with your highlights.",
         "tpl_out_note": "# Add out=<end> to a row to have it checked against in+dur before encoding.",
         "tpl_files": "# {n} file(s), full length each. Add in=/dur= to use only part of one.",
@@ -169,6 +181,16 @@ MESSAGES = {
         "err_no_video": "ingen videoström i {path}",
         "err_no_inputs": "behöver minst ett klipp",
         "err_no_output": "-o/--output krävs",
+        "yt_title_placeholder": "<TITEL>",
+        "yt_speed": "Hastighet",
+        "yt_len": "{on}",
+        "yt_len_sped": "{on} på skärmen av {rec} inspelat",
+        "yt_audio_keep": "originalljud",
+        "yt_audio_mute": "utan ljud",
+        "yt_short": "obs: kapitel {n} ({stamp}) varar bara {s} s - YouTube kräver att varje "
+                    "kapitel är minst 10 s, annars visas inga kapitel alls",
+        "yt_few": "obs: bara {n} klipp - YouTube visar kapitel först från 3",
+        "yt_written": "YouTube-kapitel: {file}",
         "err_audio_mode": "{name}: okänt ljudläge '{val}' (retime, keep eller mute)",
         "err_speed": "{name}: ogiltig hastighet '{val}' (t.ex. 2, 1.5, 0.5, 1/3)",
         "err_speed_range": "{name}: hastigheten {val} ligger utanför intervallet 0.02-50",
@@ -184,6 +206,8 @@ MESSAGES = {
                      "0.67, 0.33, 0.25, 0.12 ...)",
         "tpl_cols6": "#   audio= retime (följer hastigheten, standard) | keep (normal tonhöjd, "
                      "avhugget eller loopat) | mute",
+        "tpl_cols7": "#   title=\"Take off ESMK\"  kapitelnamn i YouTube-texten som skrivs "
+                     "bredvid videon",
         "tpl_master": "# {name} är {len} lång. Byt ut tiderna nedan mot dina höjdpunkter.",
         "tpl_out_note": "# Lägg till out=<slut> på en rad för att få den kontrollerad mot in+dur.",
         "tpl_files": "# {n} fil(er), hela längden var. Lägg till in=/dur= för att bara ta en del.",
@@ -314,6 +338,7 @@ class Clip:
     row_line: str = ""
     speed_raw: str | None = None
     audio_mode: str = ""            # retime | keep | mute
+    title: str = ""                 # YouTube chapter title
     speed: Fraction = Fraction(1)   # >1 plays faster, <1 slower
     out_len: int = 0                # frames this clip contributes to the output
     label: str = ""          # file name, plus the range when one was given
@@ -474,6 +499,36 @@ def parse_clock(value: str) -> str:
     return str(float(total))
 
 
+def tokenize(line: str) -> list[str]:
+    """Split a list-file line on whitespace, honouring quotes.
+
+    A quote opens only at the start of a token or straight after '=', so
+    title="Take off ESMK" is one token while an apostrophe inside a word
+    (Peter's) is just a character. Backslashes are literal, for Windows paths.
+    '#' outside quotes starts a comment."""
+    toks: list[str] = []
+    cur, quote = "", None
+    for ch in line:
+        if quote:
+            if ch == quote:
+                quote = None
+            else:
+                cur += ch
+        elif ch in "\"'" and (cur == "" or cur.endswith("=")):
+            quote = ch
+        elif ch == "#":
+            break
+        elif ch.isspace():
+            if cur:
+                toks.append(cur)
+                cur = ""
+        else:
+            cur += ch
+    if cur:
+        toks.append(cur)
+    return toks
+
+
 def read_list_file(list_path: Path) -> list[tuple[Path, dict]]:
     """Lines: <path> [in=..] [dur=..|out=..] [head=..] [tail=..] [fade=..]
 
@@ -485,10 +540,9 @@ def read_list_file(list_path: Path) -> list[tuple[Path, dict]]:
     rows: list[tuple[Path, dict]] = []
     base = list_path.resolve().parent
     for lineno, raw in enumerate(list_path.read_text(encoding="utf-8-sig").splitlines(), 1):
-        line = raw.split("#", 1)[0].strip()
-        if not line:
+        parts = tokenize(raw)
+        if not parts:
             continue
-        parts = [p.strip('"').strip("'") for p in shlex.split(line, posix=False)]
         p = Path(parts[0])
         if not p.is_absolute():
             p = base / p
@@ -498,7 +552,8 @@ def read_list_file(list_path: Path) -> list[tuple[Path, dict]]:
                 die("err_list_kv", file=list_path, line=lineno, tok=tok)
             k, val = tok.split("=", 1)
             k = k.lower()
-            if k not in ("head", "tail", "fade", "in", "dur", "out", "speed", "audio"):
+            if k not in ("head", "tail", "fade", "in", "dur", "out", "speed", "audio",
+                         "title"):
                 die("err_list_key", file=list_path, line=lineno, key=k)
             opts[k] = parse_clock(val) if k in ("in", "dur", "out") else val
         opts["_line"] = str(lineno)
@@ -944,6 +999,77 @@ def clock(seconds: float) -> str:
     return f"{int(h):02d}:{int(m):02d}:{sec:06.3f}".rstrip("0")
 
 
+def yt_stamp(seconds: int) -> str:
+    """YouTube chapter format: M:SS under an hour, H:MM:SS from there."""
+    h, rem = divmod(int(seconds), 3600)
+    m, sec = divmod(rem, 60)
+    return f"{h}:{m:02d}:{sec:02d}" if h else f"{m}:{sec:02d}"
+
+
+def plain_time(seconds: float) -> str:
+    """Source position written so YouTube will NOT turn it into a link.
+
+    YouTube linkifies anything shaped like 12:34 in a description, and a stray
+    timestamp between the chapters - out of order, or near the end - makes it
+    drop the whole chapter list. 1h02m03s / 14m57s is read by people, ignored
+    by YouTube."""
+    total = int(round(seconds))
+    h, rem = divmod(total, 3600)
+    m, sec = divmod(rem, 60)
+    return f"{h}h{m:02d}m{sec:02d}s" if h else f"{m}m{sec:02d}s"
+
+
+def plain_len(seconds: float) -> str:
+    total = int(round(seconds))
+    m, sec = divmod(total, 60)
+    if m >= 60:
+        h, m = divmod(m, 60)
+        return f"{h} h {m} min"
+    return f"{m} min {sec} s" if m else f"{sec} s"
+
+
+def youtube_chapters(clips: list[Clip], fps: Fraction, total: int) -> tuple[str, list[str]]:
+    """Chapter list for the YouTube description, one chapter per clip.
+
+    A chapter starts halfway through the transition into its clip, which is
+    where the new picture takes over. Returns the text and any rule YouTube
+    would reject it for: chapters are only shown when the first is 0:00, there
+    are at least three, and every one lasts 10 seconds or more."""
+    starts = []
+    for i, c in enumerate(clips):
+        if i == 0:
+            starts.append(0)
+        else:
+            # rounded up, so a click lands where the new clip has taken over
+            # rather than while the old one still dominates the blend
+            mid = c.out_start + Fraction(clips[i - 1].fade, 2)
+            starts.append(max(math.ceil(mid / fps), starts[-1] + 1))
+    ends = starts[1:] + [int(float(Fraction(total) / fps))]
+
+    lines, problems = [], []
+    for i, c in enumerate(clips):
+        title = c.title or t("yt_title_placeholder")
+        lines.append(f"{yt_stamp(starts[i])} {title}")
+        on_screen = secs(c.out_len, fps)
+        recorded = secs(c.frames - c.head - c.tail, fps)
+        spd = f"{float(c.speed):g}×"
+        if c.speed == 1:
+            length = t("yt_len", on=plain_len(on_screen))
+        else:
+            length = t("yt_len_sped", on=plain_len(on_screen), rec=plain_len(recorded))
+        src = (f"{c.path.name} {plain_time(secs(c.head, fps))}–"
+               f"{plain_time(secs(c.frames - c.tail, fps))}")
+        audio = "" if c.speed == 1 or c.audio_mode == "retime" else \
+            " · " + t("yt_audio_" + c.audio_mode)
+        lines.append(f"   {t('yt_speed')} {spd} · {length} · {src}{audio}")
+        if ends[i] - starts[i] < 10:
+            problems.append(t("yt_short", n=i + 1, stamp=yt_stamp(starts[i]),
+                              s=ends[i] - starts[i]))
+    if len(clips) < 3:
+        problems.append(t("yt_few", n=len(clips)))
+    return "\n".join(lines) + "\n", problems
+
+
 def make_list(args) -> None:
     """Write a clips list the user can open and edit, instead of typing paths."""
     paths = expand_inputs(args.inputs)
@@ -968,7 +1094,7 @@ def make_list(args) -> None:
              t("tpl_run", out="montage.mp4", name=dest.name),
              "#",
              t("tpl_cols1"), t("tpl_cols2"), t("tpl_cols3"), t("tpl_cols4"),
-             t("tpl_cols5"), t("tpl_cols6"), "#"]
+             t("tpl_cols5"), t("tpl_cols6"), t("tpl_cols7"), "#"]
 
     if args.rows:
         # range rows through one master: evenly spaced starting points, so every
@@ -1118,6 +1244,7 @@ def main() -> None:
         c.in_raw, c.dur_raw, c.out_raw = o.get("in"), o.get("dur"), o.get("out")
         c.row_file, c.row_line = o.get("_file", ""), o.get("_line", "")
         c.speed_raw = o.get("speed")
+        c.title = o.get("title", "")
         c.audio_mode = (o.get("audio") or args.clip_audio).lower()
         if c.audio_mode not in ("retime", "keep", "mute"):
             die("err_audio_mode", name=c.path.name, val=c.audio_mode)
@@ -1233,6 +1360,7 @@ def main() -> None:
             "src_in_s": secs(c.head, fps),
             "src_out_s": secs(c.frames - c.tail, fps),
             "speed": float(c.speed),
+            "title": c.title,
             "out_start_s": secs(c.out_start, fps),
             "out_end_s": secs(c.out_start + c.out_len, fps),
             "fade_from_prev_s": secs(clips[i - 1].fade, fps) if i else 0.0,
@@ -1246,6 +1374,10 @@ def main() -> None:
             src += f" -> {clips[p.clip_b].label or clips[p.clip_b].path.name}"
         return f"{p.kind:<5} {src}  [{secs(p.src, fps):.3f}s +{secs(p.frames, fps):.3f}s]"
 
+    chapters, yt_problems = youtube_chapters(clips, fps, total)
+    for msg in yt_problems:
+        print(msg, file=sys.stderr)
+
     if args.dry_run:
         for p in pieces:
             print(label(p))
@@ -1254,7 +1386,14 @@ def main() -> None:
             print("[audio]\n  $ " + fmt_cmd(audio_cmd(args, clips, fps, total, fade_in, fade_out,
                                                       work / "audio.m4a")))
         print("\n" + json.dumps(timeline, indent=2))
+        print("\n" + chapters)
         return
+
+    # written before encoding starts: it depends only on the plan, so the
+    # YouTube text can be prepared while the video is still being rendered
+    yt_path = output.with_suffix(".chapters.txt")
+    yt_path.write_text(chapters, encoding="utf-8")
+    print(t("yt_written", file=yt_path) + "\n")
 
     work.mkdir(parents=True, exist_ok=True)
 

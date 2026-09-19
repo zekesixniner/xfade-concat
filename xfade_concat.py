@@ -98,7 +98,7 @@ MESSAGES = {
         "err_no_video": "no video stream in {path}",
         "err_no_inputs": "need at least one input clip",
         "err_no_output": "-o/--output is required",
-        "yt_title_placeholder": "<TITLE>",
+        "yt_title_placeholder": "TITLE",
         "yt_speed": "Speed",
         "yt_len": "{on}",
         "yt_len_sped": "{on} on screen from {rec} recorded",
